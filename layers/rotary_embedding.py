@@ -148,6 +148,10 @@ def get_repo(
     获取RoPE实例的工厂函数
 
     Args:
+        head_size:
+        rotary_dim:
+        max_position:
+        base:
         rope_scaling: 位置插值
     """
     assert rope_scaling is None, "nano-vllm 不支持 位置插值/外推配置"

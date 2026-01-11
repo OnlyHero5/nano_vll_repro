@@ -142,11 +142,11 @@ class Sequence:
         """最后一个块中的token数"""
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
     
-    @property
+    
     def block(self, i: int):
         """获取第i个块的token列表"""
         assert 0 <= i < self.num_blocks, f"块索引越界：{i}"
-        return self.token_ids[i * self.num_blocks: (i+1) * self.block_size]
+        return self.token_ids[i * self.block_size: (i+1) * self.block_size]
     
     # ===核心操作===
     def append_token(self, token_id: int):

@@ -137,36 +137,36 @@ nanovllm/
 
 #### 上午 (AM) - Block 管理器
 
-- [ ] **3.1** 精读 vLLM PagedAttention 论文（重点第3节）
-- [ ] **3.2** 理解物理块 vs 逻辑块的概念
-- [ ] **3.3** 理解 block_table 映射机制
-- [ ] **3.4** 手写 `nanovllm/engine/block_manager.py`
-  - [ ] 定义 `Block` 类
-    - [ ] 包含 block_id, ref_count
-    - [ ] 实现 hash 计算（Prefix Caching 用）
-  - [ ] 定义 `BlockManager` 类
-    - [ ] 初始化 free_blocks 池
-    - [ ] 实现 `allocate()` 方法 - 为新序列分配块
-    - [ ] 实现 `append_slot()` 方法 - 追加 token 时的块管理
+- [✅️ ] **3.1** 精读 vLLM PagedAttention 论文（重点第3节）
+- [✅️ ] **3.2** 理解物理块 vs 逻辑块的概念
+- [ ✅️] **3.3** 理解 block_table 映射机制
+- [ ✅️] **3.4** 手写 `nanovllm/engine/block_manager.py`
+  - [ ✅️] 定义 `Block` 类
+    - [ ✅️] 包含 block_id, ref_count
+    - [✅️ ] 实现 hash 计算（Prefix Caching 用）
+  - [✅️ ] 定义 `BlockManager` 类
+    - [ ✅️] 初始化 free_blocks 池
+    - [ ✅️] 实现 `allocate()` 方法 - 为新序列分配块
+    - [ ✅️] 实现 `append_slot()` 方法 - 追加 token 时的块管理
 
 #### 下午 (PM) - Attention 层与 KV Cache
 
-- [ ] **3.5** 阅读 FlashAttention 论文，理解其优化原理
-- [ ] **3.6** 学习 flash_attn 库 API
-- [ ] **3.7** 手写 `nanovllm/layers/attention.py`
-  - [ ] 集成 `flash_attn` 库
-  - [ ] 实现 `Attention` 类
-  - [ ] 实现 KV Cache 的读写逻辑
-  - [ ] 编写 `store_kvcache` 函数（Triton/PyTorch）
-- [ ] **3.8** 理解 Prefill vs Decode 阶段的 Attention 差异
-- [ ] **3.9** 画图：物理块、逻辑块、block_table 的关系
+- [ ✅️] **3.5** 阅读 FlashAttention 论文，理解其优化原理
+- [✅️ ] **3.6** 学习 flash_attn 库 API
+- [✅️ ] **3.7** 手写 `nanovllm/layers/attention.py`
+  - [✅️ ] 集成 `flash_attn` 库
+  - [✅️ ] 实现 `Attention` 类
+  - [✅️ ] 实现 KV Cache 的读写逻辑
+  - [✅️ ] 编写 `store_kvcache` 函数（Triton/PyTorch）
+- [✅️ ] **3.8** 理解 Prefill vs Decode 阶段的 Attention 差异
+- [✅️ ] **3.9** 画图：物理块、逻辑块、block_table 的关系
 
 #### Day 3 检查点 ✅
 
-- [ ] 能清晰解释 PagedAttention 解决了什么问题
-- [ ] BlockManager 能正确分配和释放块
-- [ ] Attention 层能正确读写 KV Cache
-- [ ] 理解 hash 在 Prefix Caching 中的作用
+- [✅️ ] 能清晰解释 PagedAttention 解决了什么问题
+- [✅️ ] BlockManager 能正确分配和释放块
+- [✅️ ] Attention 层能正确读写 KV Cache
+- [ ✅️] 理解 hash 在 Prefix Caching 中的作用
 
 ---
 

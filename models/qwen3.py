@@ -26,7 +26,7 @@ from layers.rotary_embedding import get_rope
 from layers.attention import Attention
 
 class Qwen3Attention(nn.Module):
-    """Qwen3 注意力层（简化版，无 KV Cache）
+    """Qwen3 注意力层（完整包括 KV Cache）
     
     特点:
     - Grouped Query Attention (GQA): num_kv_heads < num_heads

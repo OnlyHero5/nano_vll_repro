@@ -233,3 +233,11 @@ class RowLinear(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return nn.functional.linear(x, self.weight, self.bias)
+
+
+def default_weight_loader(param: nn.Parameter, load_weight: torch.Tensor):
+    """默认权重加载器
+    用于没有自定义 weight_loader 的参数（如 embed_tokens, norm）
+    """
+    assert param.data.shape == load_weight.shape, f"Shape mismatch: {param.data.shape} vs {load_weight.shape}"
+    param.data.copy_(load_weight)

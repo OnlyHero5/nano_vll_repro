@@ -19,7 +19,7 @@ class Config:
     max_model_len: int = 4096   # 最大上下文长度
 
     # 显存管理
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.7
 
     # 并行配置
     tensor_parallel_size: int = 1   #张量并行数（1为单卡）

@@ -1,3 +1,20 @@
+"""全局上下文管理
+
+Context 用于在模型各层之间传递 PagedAttention 需要的元数据，
+避免通过函数参数层层传递。
+
+使用方式：
+1. ModelRunner 在 prepare_xxx 时调用 set_context()
+2. Attention 层通过 get_context() 获取
+
+设计理由：
+- Attention 层嵌套在 DecoderLayer 里，再嵌套在 Model 里
+- 如果用参数传递，需要修改所有中间层的 forward 签名
+- 全局 Context 可以"跳过"中间层，直接传递给需要的层
+"""
+
+
+
 from dataclasses import dataclass
 import torch
 

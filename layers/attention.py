@@ -85,8 +85,8 @@ def store_kvcache(
     block_size = kv_cache.shape[2]
 
     # KCache, VCache
-    k_cache = kv_cache[0]   # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache = kv_cache[1]
+    k_cache = kv_cache[0].contiguous()   # [num_blocks, block_size, num_kv_heads, head_dim]
+    v_cache = kv_cache[1].contiguous()
 
     # 确保连续内存
     k = k.contiguous()
@@ -201,12 +201,15 @@ class Attention(nn.Module):
         # q: [num_seqs, num_heads, head_dim] -> [num_seqs, 1, num_heads, head_dim]
         q = q.unsqueeze(1).to(torch.float16)
 
+        cache_seqlens=context.context_lens.to(torch.int32)
+        block_table=context.block_tables.to(torch.int32)
+
         output = flash_attn_with_kvcache(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            cache_seqlens=context.context_lens,
-            block_table=context.block_tables,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
             softmax_scale=self.scale,
             causal=True
         )

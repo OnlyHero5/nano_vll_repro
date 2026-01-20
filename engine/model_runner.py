@@ -62,7 +62,9 @@ class ModelRunner:
         # 模型配置缓存
         self.num_layers = self.model.config.num_hidden_layers
         self.num_kv_heads = self.model.config.num_key_value_heads
-        self.head_dim = (
+        self.head_dim = getattr(
+            self.model.config,
+            "head_dim",
             self.model.config.hidden_size // self.model.config.num_attention_heads
         )
 

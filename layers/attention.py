@@ -98,7 +98,7 @@ def store_kvcache(
     BLOCK_H = min(32, num_heads)
     BLOCK_D = min(32, head_dim)
 
-    store_kvcache_kernel(
+    store_kvcache_kernel[grid](
         k, v,
         k_cache, v_cache,
         slot_mapping,

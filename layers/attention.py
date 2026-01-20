@@ -85,8 +85,8 @@ def store_kvcache(
     block_size = kv_cache.shape[2]
 
     # KCache, VCache
-    k_cache = kv_cache[0].contiguous()   # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache = kv_cache[1].contiguous()
+    k_cache = kv_cache[0]   # [num_blocks, block_size, num_kv_heads, head_dim]
+    v_cache = kv_cache[1]
 
     # 确保连续内存
     k = k.contiguous()

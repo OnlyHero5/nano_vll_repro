@@ -1,478 +1,503 @@
-# 02. 补齐 Qwen3 模型主干与权重映射
+# 02. 补齐 Qwen3 模型主干与权重映射（按 HF 语义对齐）
 
-## 1. 学习目标
+## 1. 本篇目标
 
-这一篇的目标是把“模型骨架”升级成“和 Qwen3 主流实现一致的可加载主干”。
+这一篇的任务不是“把模型文件写长一点”，而是把你现在的 Qwen3 骨架改成：
 
-你要完成的核心事情有三件：
+1. 配置字段能正确承接 HF `Qwen3Config`
+2. 注意力层顺序和 HF 真正一致
+3. `from_pretrained()`、`packed_modules_mapping`、`compute_logits()` 这些边界清晰可用
+4. 后续 Day4 / Day5 / Day6 不需要再回头重构模型主干
 
-1. 让 `config.py` 真正承接 Hugging Face `Qwen3Config` 里的关键字段
-2. 让 `models/qwen3.py` 的结构顺序对齐 HF `Qwen3`
-3. 让 `layers/rotary_embedding.py` 至少能兼容 `rope_parameters`
+做完以后，至少应达到下面的状态：
 
-这一篇完成后，仓库应该具备：
+- `config.py` 可以稳定暴露 `head_dim / num_key_value_heads / rope_parameters / attention_bias`
+- `layers/rotary_embedding.py` 不再只认死板的 `rope_theta`
+- `models/qwen3.py` 里的 `Qwen3Attention / Qwen3DecoderLayer / Qwen3ForCausalLM` 语义与 HF 对齐
+- `tests/test_Day2.py` 不再调用已经不存在或即将废弃的旧接口
 
-- 正确的 `Qwen3Attention / Qwen3MLP / Qwen3DecoderLayer`
-- 正确的 residual / norm 顺序
-- 与 HF 命名兼容的权重映射入口
+---
 
-## 2. 先修知识
+## 2. 权威参考
 
-## 2.1 为什么 Qwen3 容易“看起来写对了，实际上写错了”
+本篇强制对照 4 个文件：
 
-Qwen3 不是“普通 Transformer + RoPE”这么简单。
+1. 当前仓库：
+   - `nano_vll_repro/config.py`
+   - `nano_vll_repro/layers/rotary_embedding.py`
+   - `nano_vll_repro/models/qwen3.py`
+   - `nano_vll_repro/tests/test_Day2.py`
+2. HF 配置：
+   - `transformers/.../configuration_qwen3.py`
+3. HF 模型：
+   - `transformers/.../modeling_qwen3.py`
+4. 上游教学实现：
+   - `nano-vllm/nanovllm/models/qwen3.py`
 
-最容易写错的地方有 4 个：
+本篇最重要的判断标准不是“像不像上游教学代码”，而是：
 
-1. `q_norm / k_norm` 的位置
-2. `head_dim` 的来源
-3. `num_key_value_heads` 对 GQA 的影响
-4. decoder layer 的 residual 顺序
+> 你的模型语义是否真的和 HF `Qwen3` 一致。
 
-如果你把这 4 个点写错，即使代码能跑，也可能：
+---
 
-- 权重加载失败
-- logits 明显异常
-- FlashAttention 输入形状不匹配
-- 多卡切分后 head 维度错位
+## 3. 先看当前仓库到底缺什么
 
-## 2.2 HF `Qwen3Attention` 的正确顺序
+### 3.1 `config.py` 的问题
 
-根据 Hugging Face `transformers` 的 `Qwen3Attention`，顺序应该是：
+当前 `Config` 只有最基础的路径和显存参数，但后续链路至少还要依赖这些字段：
 
-```text
-q_proj / k_proj / v_proj
--> reshape 成多头
--> q_norm / k_norm
--> RoPE
--> attention
--> o_proj
-```
+- `dtype`
+- `kv_cache_dtype`
+- `max_cudagraph_batch_size`
+- `head_dim`
+- `num_key_value_heads`
+- `attention_bias`
+- `hidden_act`
+- `tie_word_embeddings`
+- `rope_parameters`
+- `layer_types`
+- `use_sliding_window / sliding_window`
 
-注意：
+如果这一步不补，后面你每写一篇都会继续在各处手搓 `getattr(...)`。
 
-- `q_norm / k_norm` 是做在 `head_dim` 上，不是在整个 `hidden_size` 上
-- RoPE 要在 norm 之后
-- `num_key_value_heads` 不等于 `num_attention_heads` 时，就是 GQA
+### 3.2 `rotary_embedding.py` 的问题
 
-## 2.3 decoder layer 的正确顺序
+当前文件基本还是上游早期简化版，只支持：
 
-Qwen3 的 decoder layer 是标准的 **pre-norm + residual**：
+- `base=rope_theta`
+- `rotary_dim == head_size`
 
-```text
-residual = hidden_states
-hidden_states = input_layernorm(hidden_states)
-hidden_states = self_attn(hidden_states)
-hidden_states = residual + hidden_states
+这在“只想跑一个最小 demo”时没问题，但你现在已经明确要按 HF `Qwen3` 语义继续走，所以至少要能：
 
-residual = hidden_states
-hidden_states = post_attention_layernorm(hidden_states)
-hidden_states = mlp(hidden_states)
-hidden_states = residual + hidden_states
-```
+- 接受 `rope_parameters`
+- 明确写出当前仓库“只支持默认 RoPE，不支持完整动态外推”的边界
 
-这里最容易犯的错，是把你当前仓库里 `RMSNorm` 的 fused residual 写法直接套进来，结果把语义写歪。
+### 3.3 `models/qwen3.py` 的问题
 
-我的建议是：
+这里有 7 个关键缺口：
 
-- 先按 HF 语义写正确
-- 后面真要做 fused norm，再作为优化层补
+1. `Qwen3Attention` 里头数与 `head_dim` 的语义还是“能跑就行”的状态。
+2. `q_norm / k_norm` 虽然写了，但没有明确说明它们必须在 head 维度上做、且在 RoPE 之前做。
+3. `Qwen3DecoderLayer` 现在用了 fused `RMSNorm`，但文档没解释它和 HF residual 顺序为什么等价。
+4. 线性层构造参数还停留在旧版骨架风格，和 `01` 里补齐后的 `QKVLinear / MergedLinear` 签名对不上。
+5. `Qwen3ForCausalLM.forward()` 直接返回 logits，后面 Day4 / Day6 做 runner 和 graph 时不够灵活。
+6. `compute_logits()` 缺失，导致 logits head 和主干边界不清楚。
+7. `from_pretrained()` 只是打印信息，没有把“结构创建”和“权重加载”边界解释清楚。
 
-## 3. 本仓库当前缺口
+### 3.4 `tests/test_Day2.py` 的问题
 
-当前仓库在这一块有 5 个问题：
+这个测试文件已经暴露出至少两处接口漂移：
 
-1. `config.py` 只承接了很少的 HF 配置字段
-2. `models/qwen3.py` 虽然长得像 Qwen3，但 residual 语义还没完全贴齐
-3. `from_pretrained()` 里的行为还不够干净
-4. `layers/rotary_embedding.py` 只支持旧式 `rope_theta`
-5. 还没有把“HF 命名 -> 仓库内部融合命名”的边界说清楚
+1. `test_gqa()` 还在给 `Qwen3Attention` 传 `attention_mask=None`
+2. `test_qwen3_model()` 默认认为 `model(input_ids)` 直接返回 logits
 
-## 4. 最终应修改的文件
+如果你本篇把模型接口收口，这两个测试都要同步改。
 
-- `config.py`
-- `layers/rotary_embedding.py`
-- `models/qwen3.py`
+---
 
-## 5. 完整代码
+## 4. 本篇修改原则
 
-### 5.1 替换 `config.py`
+### 4.1 不把模型重写成 HF 原样
+
+HF 用的是通用 batch 维接口、cache 抽象、mask 系统；你的仓库当前是单维 token 流 + 全局 `Context`。
+
+所以本篇只对齐“语义”，不照搬“外壳”：
+
+- 保留你当前 `positions + hidden_states` 的调用方式
+- 保留 fused `RMSNorm` API
+- 但让层内顺序、字段来源、权重映射都和 HF 对齐
+
+### 4.2 现在就把后续需要的配置字段补出来
+
+尤其是：
+
+- `dtype / kv_cache_dtype / max_cudagraph_batch_size`
+
+这三个字段如果现在不补，后面 04~06 会反复来回改 `Config`。
+
+### 4.3 把 logits head 和主干拆开
+
+后面做 `ModelRunner.run_model()` 和 `CUDA Graph` 时，最干净的边界是：
+
+- `Qwen3ForCausalLM.forward()` 返回 hidden states
+- `compute_logits(hidden_states)` 单独负责 vocab 投影
+
+这是本篇最值得提前做的接口收口。
+
+---
+
+## 5. 逐步修改
+
+## 5.1 先扩 `config.py`，但保留 `model_path` 这个本地命名
+
+修改位置：
+
+- 文件：`nano_vll_repro/config.py`
+- 锚点 1：定位到 `@dataclass class Config:` 的字段定义区，在 `enforce_eager` 后、`hf_config` 前插入新的 dtype / cudagraph 字段
+- 锚点 2：定位到 `class Config` 内已有 property 区，把下面给出的 property 逐个补进去；如果同名 property 已存在，就整段替换
+
+不要为了对齐上游把字段名直接改成 `model`。你当前仓库大量地方已经在用 `model_path`，现在没有必要为了“更像上游”引入一轮无收益重命名。
+
+推荐做法是：
+
+1. 继续保留 `model_path`
+2. 补一个 `model` property 作为别名
+3. 把后续文档会用到的字段一次补齐
+
+建议你在 dataclass 里新增这些字段：
 
 ```python
-import os
-from dataclasses import dataclass
-
-import torch
-from transformers import AutoConfig
-
-
-@dataclass
-class Config:
-    model_path: str
-
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
-    max_model_len: int = 4096
-
-    gpu_memory_utilization: float = 0.7
-    tensor_parallel_size: int = 1
-    enforce_eager: bool = False
-
-    dtype: str = "auto"
-    kv_cache_dtype: str = "auto"
-    max_cudagraph_batch_size: int = 32
-
-    hf_config: AutoConfig | None = None
-    eos: int = -1
-
-    kvcache_block_size: int = 256
-    num_kvcache_blocks: int = -1
-
-    def __post_init__(self) -> None:
-        assert os.path.isdir(self.model_path), f"模型路径不存在：{self.model_path}"
-        assert self.kvcache_block_size % 256 == 0, "kvcache_block_size 必须是 256 的倍数"
-        assert 1 <= self.tensor_parallel_size <= 8, "tensor_parallel_size 必须在 1 到 8 之间"
-
-        self.hf_config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
-        self.max_model_len = min(
-            self.max_model_len,
-            getattr(self.hf_config, "max_position_embeddings", self.max_model_len),
-        )
-        assert self.max_num_batched_tokens >= self.max_model_len
-
-    @property
-    def model(self) -> str:
-        return self.model_path
-
-    @property
-    def hidden_size(self) -> int:
-        return self.hf_config.hidden_size
-
-    @property
-    def intermediate_size(self) -> int:
-        return self.hf_config.intermediate_size
-
-    @property
-    def num_hidden_layers(self) -> int:
-        return self.hf_config.num_hidden_layers
-
-    @property
-    def num_attention_heads(self) -> int:
-        return self.hf_config.num_attention_heads
-
-    @property
-    def num_key_value_heads(self) -> int:
-        return self.hf_config.num_key_value_heads
-
-    @property
-    def head_dim(self) -> int:
-        return getattr(self.hf_config, "head_dim", self.hidden_size // self.num_attention_heads)
-
-    @property
-    def rms_norm_eps(self) -> float:
-        return self.hf_config.rms_norm_eps
-
-    @property
-    def max_position_embeddings(self) -> int:
-        return self.hf_config.max_position_embeddings
-
-    @property
-    def rope_parameters(self):
-        return getattr(self.hf_config, "rope_parameters", None)
-
-    @property
-    def rope_theta(self) -> float:
-        rope_parameters = self.rope_parameters
-        if isinstance(rope_parameters, dict):
-            return rope_parameters.get("rope_theta", rope_parameters.get("base", 1000000.0))
-        return getattr(self.hf_config, "rope_theta", 1000000.0)
-
-    @property
-    def attention_bias(self) -> bool:
-        return getattr(self.hf_config, "attention_bias", False)
-
-    @property
-    def attention_dropout(self) -> float:
-        return getattr(self.hf_config, "attention_dropout", 0.0)
-
-    @property
-    def hidden_act(self) -> str:
-        return getattr(self.hf_config, "hidden_act", "silu")
-
-    @property
-    def tie_word_embeddings(self) -> bool:
-        return getattr(self.hf_config, "tie_word_embeddings", False)
-
-    @property
-    def layer_types(self):
-        return getattr(self.hf_config, "layer_types", None)
-
-    @property
-    def use_sliding_window(self) -> bool:
-        return getattr(self.hf_config, "use_sliding_window", False)
-
-    @property
-    def sliding_window(self):
-        return getattr(self.hf_config, "sliding_window", None)
-
-    @property
-    def torch_dtype(self) -> torch.dtype:
-        if self.dtype == "bfloat16":
-            return torch.bfloat16
-        if self.dtype == "float16":
-            return torch.float16
-        if self.dtype == "float32":
-            return torch.float32
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        if torch.cuda.is_available():
-            return torch.float16
-        return torch.float32
-
-    @property
-    def kv_torch_dtype(self) -> torch.dtype:
-        if self.kv_cache_dtype == "auto":
-            return torch.float16 if torch.cuda.is_available() else torch.float32
-        if self.kv_cache_dtype == "bfloat16":
-            return torch.bfloat16
-        if self.kv_cache_dtype == "float16":
-            return torch.float16
-        return torch.float32
+dtype: str = "auto"
+kv_cache_dtype: str = "auto"
+max_cudagraph_batch_size: int = 32
 ```
 
-### 5.2 替换 `layers/rotary_embedding.py`
+然后把属性访问面扩成下面这种风格：
 
 ```python
-from functools import lru_cache
+@property
+def head_dim(self) -> int:
+    """
+    输入：无。
+    输出：单头维度。
 
-import torch
-from torch import nn
-
-
-def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-    ) -> None:
-        super().__init__()
-        assert rotary_dim == head_size, "当前实现要求 rotary_dim == head_size"
-        self.head_size = head_size
-        self.rotary_dim = rotary_dim
-
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
-        )
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze(1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
-        return query, key
+    为什么不能简单写 hidden_size // num_attention_heads：
+    因为 HF 的 Qwen3Config 允许显式给出 head_dim；
+    只有配置里没有该字段时，才回退到 hidden_size // num_attention_heads。
+    """
+    return getattr(self.hf_config, "head_dim", self.hidden_size // self.num_attention_heads)
 
 
-@lru_cache(maxsize=8)
+@property
+def rope_parameters(self):
+    """
+    输入：无。
+    输出：HF 配置里的 rope_parameters；如果模型配置没有该字段，则返回 None。
+
+    后续 `rotary_embedding.py` 只从这里拿数据，不要让每个调用点都重复自己解析 HF config。
+    """
+    return getattr(self.hf_config, "rope_parameters", None)
+
+
+@property
+def rope_theta(self) -> float:
+    """
+    输入：无。
+    输出：当前仓库实际使用的 rope theta。
+
+    兼容策略：
+    1. 如果 rope_parameters 是 dict，优先取其中的 rope_theta；
+    2. 如果没有，再回退到老式的 hf_config.rope_theta；
+    3. 最后才给默认值。
+    """
+    rope_parameters = self.rope_parameters
+    if isinstance(rope_parameters, dict):
+        return rope_parameters.get("rope_theta", rope_parameters.get("base", 1000000.0))
+    return getattr(self.hf_config, "rope_theta", 1000000.0)
+```
+
+还要补两个 dtype property，因为 04 / 05 / 06 都会直接依赖：
+
+```python
+@property
+def torch_dtype(self) -> torch.dtype:
+    """
+    输入：无。
+    输出：模型权重与主干计算使用的 torch.dtype。
+
+    这里故意支持 "auto"：
+    - 有 CUDA 且支持 BF16 时优先 BF16；
+    - 否则回退 FP16 / FP32；
+    - 不把 dtype 决策写死在 ModelRunner 里。
+    """
+    if self.dtype == "bfloat16":
+        return torch.bfloat16
+    if self.dtype == "float16":
+        return torch.float16
+    if self.dtype == "float32":
+        return torch.float32
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
+
+
+@property
+def kv_torch_dtype(self) -> torch.dtype:
+    """
+    输入：无。
+    输出：KV Cache 使用的 dtype。
+
+    单独拆出来的原因：
+    后续很容易出现“模型用 BF16，但 KV Cache 暂时仍想用 FP16”的场景。
+    """
+    if self.kv_cache_dtype == "bfloat16":
+        return torch.bfloat16
+    if self.kv_cache_dtype == "float16":
+        return torch.float16
+    if self.kv_cache_dtype == "float32":
+        return torch.float32
+    if self.kv_cache_dtype == "auto":
+        return torch.float16 if torch.cuda.is_available() else torch.float32
+    raise ValueError(f"不支持的 kv_cache_dtype: {self.kv_cache_dtype}")
+```
+
+---
+
+## 5.2 在 `rotary_embedding.py` 里把“支持范围”和“暂不支持范围”都写清楚
+
+修改位置：
+
+- 文件：`nano_vll_repro/layers/rotary_embedding.py`
+- 锚点：定位到文件底部现有的 `get_rope(...)` 工厂函数，从函数签名开始到 `return RotaryEmbedding(...)` 结束，整段替换为下面这份实现
+
+这一步不要追求一次支持 HF 所有 RoPE 变体。对你当前仓库最现实的目标是：
+
+1. 支持从 `rope_parameters` 里解析 `rope_theta`
+2. 如果有人传入动态缩放 / 外推配置，直接明确报错
+
+建议你只改 `get_rope()` 的参数面和边界检查，不要把整个 `RotaryEmbedding` 重写一遍。
+
+重点片段可以写成：
+
+```python
+@lru_cache(maxsize=1)
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
-    rope_parameters: dict | None = None,
+    rope_scaling: dict | None = None,
 ) -> RotaryEmbedding:
-    if rope_parameters is not None:
-        rope_type = rope_parameters.get("rope_type", "default")
-        if rope_type != "default":
-            raise NotImplementedError(
-                f"当前教案只实现 default RoPE，暂不支持 rope_type={rope_type}"
-            )
-        base = rope_parameters.get("rope_theta", rope_parameters.get("base", base))
+    """
+    输入：
+    - head_size / rotary_dim / max_position / base: 当前仓库真正需要的最小 RoPE 参数集
+    - rope_scaling: 预留给 HF 配置的兼容入口
 
-    return RotaryEmbedding(
-        head_size=head_size,
-        rotary_dim=rotary_dim,
-        max_position_embeddings=max_position,
-        base=base,
-    )
+    输出：RotaryEmbedding 实例
+
+    当前策略写死说明：
+    - 这份教学仓库只支持默认 RoPE；
+    - 如果你后面要做 yarn / longrope / dynamic_ntk，再单独开一篇，不要在这里偷塞半套逻辑。
+    """
+    assert rope_scaling is None, "当前教学仓库只支持默认 RoPE，暂不支持 rope_scaling"
+    return RotaryEmbedding(head_size, rotary_dim, max_position, base)
 ```
 
-### 5.3 替换 `models/qwen3.py`
+这样做的好处是：
+
+- 接口已经和 HF 接上了
+- 但实现边界仍然明确，不会制造“看起来支持，实际上偷偷忽略参数”的假象
+
+---
+
+## 5.3 重写 `Qwen3Attention` 的“头数语义”，不是重写整层
+
+当前 `Qwen3Attention` 最大的问题不是 forward 写错，而是“局部头数 / 总头数 / head_dim”关系没有被说清楚。
+
+### 先把线性层构造参数改到和 `01` 一致
+
+修改位置：
+
+- 文件：`nano_vll_repro/models/qwen3.py`
+- 锚点 1：定位到 `class Qwen3Attention.__init__`
+- 锚点 2：定位到 `class Qwen3MLP.__init__`
+- 要求：下面给出的构造器片段是“替代代码”，不是新增注释
+
+在真正改 forward 之前，先把构造器用法对齐到 `01` 里补齐后的线性层签名。
+
+`qkv_proj` 不应该再写成旧的：
 
 ```python
-import torch
-from torch import nn
-from transformers import AutoConfig
+self.qkv_proj = QKVLinear(
+    hidden_size=hidden_size,
+    num_heads=self.num_heads,
+    num_kv_heads=self.num_kv_heads,
+    head_dim=self.head_dim,
+    bias=qkv_bias,
+)
+```
 
-from layers.activation import SiluAndMul
-from layers.attention import Attention
-from layers.layernorm import RMSNorm
-from layers.linear import QKVLinear, MergedLinear, RowLinear, divide, get_tp_world_size
-from layers.rotary_embedding import get_rope
+而应该改成：
 
+```python
+self.qkv_proj = QKVLinear(
+    hidden_size=hidden_size,
+    head_size=self.head_dim,
+    total_num_heads=self.total_num_heads,
+    total_num_kv_heads=self.total_num_kv_heads,
+    bias=qkv_bias,
+)
+```
 
+`Qwen3MLP` 里的 `gate_up_proj` 也一样，旧的：
+
+```python
+self.gate_up_proj = MergedLinear(
+    input_size=hidden_size,
+    output_size=intermediate_size,
+    num_shards=2,
+    bias=False,
+)
+```
+
+要改成：
+
+```python
+self.gate_up_proj = MergedLinear(
+    input_size=hidden_size,
+    output_sizes=[intermediate_size, intermediate_size],
+    bias=False,
+)
+```
+
+这一步看起来像“只是改参数名”，但本质上是在让模型主干和 `01` 的融合线性层契约重新对齐。
+
+这里建议你按下面顺序收口：
+
+1. 先保留 `hidden_size / num_heads / num_kv_heads / head_dim`
+2. 显式区分 `total_num_heads` 和 `num_heads`
+3. 先让单卡时两者相等，为 Day5 的 TP 留口子
+4. `q_size / kv_size` 全部基于“当前模块真正输出的本地头数”计算
+
+建议的局部结构如下：
+
+```python
 class Qwen3Attention(nn.Module):
-    def __init__(self, config, layer_idx: int = 0) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int | None = None,
+        max_position: int = 4096 * 32,
+        rms_norm_eps: float = 1e-6,
+        qkv_bias: bool = False,
+        rope_theta: float = 1000000.0,
+        layer_idx: int = 0,
+    ) -> None:
         super().__init__()
-        tp_size = get_tp_world_size()
 
-        self.hidden_size = config.hidden_size
-        self.total_num_heads = config.num_attention_heads
-        self.total_num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        # 这里先把“总头数”保留下来；单卡时 total == local，
+        # 但 Day5 做 TP 时就会把这两个概念拆开。
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
 
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        # 当前阶段先按单卡处理，所以 local 头数先等于 total。
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
 
+        # head_dim 一定优先信任配置，而不是永远自己算。
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
+```
 
-        self.qkv_proj = QKVLinear(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
-            bias=getattr(config, "attention_bias", False),
-        )
-        self.o_proj = RowLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=getattr(config, "attention_bias", False),
-        )
+然后把投影顺序固定成 HF 的语义：
 
-        rope_parameters = getattr(config, "rope_parameters", None)
-        rope_theta = getattr(config, "rope_theta", 1000000.0)
-        if isinstance(rope_parameters, dict):
-            rope_theta = rope_parameters.get("rope_theta", rope_parameters.get("base", rope_theta))
+修改位置：
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            rope_parameters=rope_parameters,
-        )
+- 文件：`nano_vll_repro/models/qwen3.py`
+- 锚点：定位到 `class Qwen3Attention.forward` 内部，从 `qkv = self.qkv_proj(...)` 开始，到 `q, k = self.rotary_emb(...)` 结束，替换为下面这段
 
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+```python
+qkv = self.qkv_proj(hidden_states)
+q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        self.attn = Attention(
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            scale=self.scaling,
-            layer_idx=layer_idx,
-        )
+# 先 reshape 成多头，再在 head_dim 上做 q_norm / k_norm。
+q = q.view(num_tokens, self.num_heads, self.head_dim)
+k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens = hidden_states.shape[0]
+# 注意：Qwen3 的 q_norm / k_norm 是作用在 head_dim 上，而不是 hidden_size 上。
+q = self.q_norm(q)
+k = self.k_norm(k)
 
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+# RoPE 一定在 q/k norm 之后。
+q, k = self.rotary_emb(positions, q, k)
+```
 
-        q = q.view(num_tokens, self.num_heads, self.head_dim)
-        k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+这里不要再保留旧版大段注释掉的“手写 attention fallback”逻辑。那段代码会模糊当前 Attention 层的真实职责：
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
+- `Qwen3Attention` 负责投影、norm、RoPE、调 `Attention`
+- 真正的 prefill / decode 分流由 `layers/attention.py` + `Context` 决定
 
-        attn_output = self.attn(q, k, v)
-        return self.o_proj(attn_output.reshape(num_tokens, -1))
+---
 
+## 5.4 在 `Qwen3DecoderLayer` 里把 fused RMSNorm 和 HF residual 顺序讲明白
 
-class Qwen3MLP(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        hidden_act = getattr(config, "hidden_act", "silu")
-        assert hidden_act in {"silu", "swiglu"}, f"暂不支持 hidden_act={hidden_act}"
+你当前仓库有个很容易让后续读者误解的点：
 
-        self.gate_up_proj = MergedLinear(
-            input_size=config.hidden_size,
-            output_size=config.intermediate_size,
-            num_shards=2,
-            bias=False,
-        )
-        self.down_proj = RowLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
-        self.act_fn = SiluAndMul()
+- 代码是 fused `RMSNorm(x, residual)`
+- 但 HF 是显式的 `residual + norm + sublayer`
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(hidden_states)
-        hidden_states = self.act_fn(gate_up)
-        hidden_states = self.down_proj(hidden_states)
-        return hidden_states
+这两者不是冲突关系，而是“语义等价、实现不同”。
 
+建议你保留 fused API，但把 forward 改成下面这种可读性更强的形态：
 
-class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int) -> None:
-        super().__init__()
-        self.self_attn = Qwen3Attention(config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+修改位置：
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+- 文件：`nano_vll_repro/models/qwen3.py`
+- 锚点：定位到 `class Qwen3DecoderLayer.forward`，从方法签名开始到 `return hidden_states, residual` 结束，整段替换
+
+```python
+def forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    输入：
+    1. positions: 当前 token 位置。
+    2. hidden_states: 当前层输入。
+    3. residual: 累积残差；首层为 None。
+
+    输出：
+    1. hidden_states: 当前层子模块输出。
+    2. residual: 供下一层继续复用的残差。
+
+    语义说明：
+    这份写法虽然用了 fused RMSNorm，但它等价于 HF 的：
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = input_layernorm(hidden_states)
+        hidden_states = self_attn(hidden_states)
         hidden_states = residual + hidden_states
+    """
+    if residual is None:
+        hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+    hidden_states = self.self_attn(positions, hidden_states)
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)
+    return hidden_states, residual
+```
 
+你这里真正要教会后续自己的不是 fused API，而是：
 
-class Qwen3Model(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+- residual 何时更新
+- 为什么更新后还要把 residual 单独往下传
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if positions is None:
-            positions = torch.arange(input_ids.shape[0], device=input_ids.device)
+---
 
-        hidden_states = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+## 5.5 把 `Qwen3ForCausalLM` 改成“主干输出 hidden states，lm_head 单独算 logits”
 
+这是本篇最重要的接口重构。
 
+推荐目标结构：
+
+修改位置：
+
+- 文件：`nano_vll_repro/models/qwen3.py`
+- 锚点 1：定位到 `class Qwen3ForCausalLM`
+- 锚点 2：把 `forward(...)` 与 `from_pretrained(...)` 改成下面这份完整替代代码
+- 锚点 3：如果当前类里没有 `compute_logits(...)`，就在 `forward(...)` 后面直接插入
+
+```python
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -491,58 +516,173 @@ class Qwen3ForCausalLM(nn.Module):
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions)
-        return self.lm_head(hidden_states)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        输入：token ids 与可选位置。
+        输出：最后一层 hidden states，而不是 logits。
 
-    @classmethod
-    def from_pretrained(cls, model_path: str):
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        return cls(config)
+        为什么现在就拆开：
+        - Day4 的 ModelRunner 更适合显式控制“先主干、再 logits、再 sampler”；
+        - Day6 的 CUDA Graph 更适合捕获 hidden states 主干，而不是超大的 vocab logits。
+        """
+        return self.model(input_ids, positions)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        输入：主干输出的 hidden states。
+        输出：词表维 logits。
+        """
+        return self.lm_head(hidden_states)
 ```
 
-## 6. 手敲顺序
+`from_pretrained()` 则只负责“根据 HF 配置实例化结构”，不要在这里偷偷加载权重：
 
-建议顺序：
+```python
+@classmethod
+def from_pretrained(cls, model_path: str):
+    """
+    输入：HF 模型目录。
+    输出：仅已创建结构、尚未加载 safetensors 的模型实例。
 
-1. 先重写 `config.py`
-2. 再重写 `layers/rotary_embedding.py`
-3. 最后重写 `models/qwen3.py`
+    这样做的原因：
+    - 结构创建属于模型类职责；
+    - 实际权重写入由 utils.loader.load_model() 负责；
+    - 这两个阶段分开后，后面的测试和调试都更清楚。
+    """
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    return cls(config)
+```
 
-为什么这样排：
+---
 
-- `models/qwen3.py` 会同时依赖前两个文件
-- 如果你先写模型文件，手敲过程中很容易来回改配置与 RoPE
+## 5.6 同步修 `tests/test_Day2.py`，不要让测试继续绑死旧接口
 
-## 7. 最小验收方法
+本篇最少要改两处测试。
 
-### 7.1 语法校验
+### 改动 1：`test_qwen3_model()`
+
+修改位置：
+
+- 文件：`nano_vll_repro/tests/test_Day2.py`
+- 锚点：定位到 `def test_qwen3_model()` 里第一次对 `model(...)` 的调用，把原来的 `logits = model(input_ids)` 调用段替换为下面这段
+
+旧写法：
+
+```python
+logits = model(input_ids)
+```
+
+改成：
+
+```python
+positions = torch.arange(num_tokens)
+hidden_states = model(input_ids, positions)
+logits = model.compute_logits(hidden_states)
+```
+
+原因：
+
+- 这一步不是“多写几行”，而是让测试和你后续 runner 的真实调用方式统一
+
+### 改动 2：`test_gqa()`
+
+修改位置：
+
+- 文件：`nano_vll_repro/tests/test_Day2.py`
+- 锚点：定位到 `def test_gqa()` 里的 `attn(...)` 调用，把旧的三参数调用替换为下面这条两参数调用
+
+把旧的：
+
+```python
+output = attn(positions, hidden_states, attention_mask=None)
+```
+
+改成：
+
+```python
+output = attn(positions, hidden_states)
+```
+
+原因：
+
+- 当前仓库的 `Qwen3Attention.forward()` 不吃 `attention_mask`
+- mask / prefill / decode 分流是在 `layers/attention.py` 里通过 `Context` 做的
+
+---
+
+## 6. 本篇结束后的最小验收
+
+先做语法级检查：
 
 ```bash
+cd nano_vll_repro
 python -m py_compile config.py layers/rotary_embedding.py models/qwen3.py
 ```
 
-### 7.2 Day2 测试入口
-
-如果你的环境有 `torch`：
+再跑 Day2：
 
 ```bash
 python tests/test_Day2.py
 ```
 
-### 7.3 手动自测问题
+如果你想单独验证模型接口边界，可以手动执行：
 
-如果你能自己回答下面 4 个问题，就说明这一篇真正学会了：
+```bash
+python - <<'PY'
+import torch
+from models.qwen3 import Qwen3ForCausalLM
 
-1. 为什么 `q_norm / k_norm` 要放在 RoPE 前面
-2. 为什么 `head_dim` 不能总写死成 `hidden_size // num_attention_heads`
-3. 为什么 `num_key_value_heads` 会直接影响 QKV 的 split 形状
-4. 为什么 decoder layer 里不要急着上 fused residual 写法
+model = Qwen3ForCausalLM.from_pretrained("models/Qwen3-0.6B")
+input_ids = torch.tensor([1, 2, 3, 4])
+positions = torch.arange(4)
+hidden = model(input_ids, positions)
+logits = model.compute_logits(hidden)
+print(hidden.shape, logits.shape)
+PY
+```
 
-下一篇进入：
+---
+
+## 7. 常见错误
+
+### 7.1 继续把 `forward()` 当成“必须直接吐 logits”
+
+后果：
+
+- 后面 `ModelRunner` 不得不把“主干前向 + vocab 投影 + sampler”揉在一起
+- `CUDA Graph` 时更难控制捕获边界
+
+### 7.2 把 `q_norm / k_norm` 放在 reshape 之前
+
+后果：
+
+- 你做的是对 `hidden_size` 维归一化，不是 HF 的 `head_dim` 归一化
+- 数值语义已经不是 Qwen3 了
+
+### 7.3 `rope_parameters` 表面接了，实际完全忽略
+
+后果：
+
+- 文档会给人一种“已经兼容 HF 配置”的错觉
+- 还不如明确断言“当前只支持默认 RoPE”
+
+### 7.4 测试文件不改
+
+后果：
+
+- 你会误以为模型实现有 bug
+- 实际上只是测试脚本仍在调用旧接口
+
+---
+
+## 8. 本篇真正学到的东西
+
+这一篇你真正要掌握的是：
+
+1. HF `Qwen3` 的语义边界到底在哪里。
+2. 为什么模型主干和 logits head 最好拆开。
+3. 为什么“能跑的教学骨架”和“可继续演进的仓库主干”不是一回事。
+
+完成后进入下一篇：
 
 - [03-补全Sampler与SamplingParams.md](/home/psx/nano_vllm_repro/nano_vll_repro/plans/03-补全Sampler与SamplingParams.md)

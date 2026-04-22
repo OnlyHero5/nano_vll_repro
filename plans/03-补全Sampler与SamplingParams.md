@@ -76,7 +76,11 @@
 
 ### 3.4 `tests/test_Day1.py`
 
-Day1 现在还在把 `SamplingParams(temperature=0)` 当成非法输入，这和你当前 `Sampler` 的设计已经矛盾了。
+Day1 现在至少有 3 处接口漂移：
+
+1. 还在把 `SamplingParams(temperature=0)` 当成非法输入，这和你当前 `Sampler` 的 greedy 语义已经矛盾了。
+2. 还在把 `set_context(...)` 当成“接收关键字参数的函数”，但当前 `utils.context.set_context()` 实际接收的是一个 `Context` 实例。
+3. `test_config()` 里还在写 `Config(model=...)`，但当前配置类构造参数名是 `model_path`。
 
 ### 3.5 `tests/test_Day4.py`
 
@@ -351,16 +355,16 @@ return sampled_tokens
 - 文件：`nano_vll_repro/tests/test_Day1.py`
 - 锚点：定位到 `def test_sampling_params()` 里“temperature=0 应该失败”的旧断言段，整段替换为下面这组新断言
 
-这一步很多人会忘。你现在必须把 Day1 里关于 `temperature=0` 的旧断言改掉。
+这一步很多人会忘。由于本篇最后会把 `tests/test_Day1.py` 当成回归入口，所以这里不能只修 `temperature=0` 这一处，而要把同文件里已经漂掉的 `Context / Config` 调用一并修掉。
 
 旧逻辑：
 
 ```python
 try:
-    SamplingParams(top_p=0.0)
+    SamplingParams(temperature=0.0)
     print("❌ 应该抛出异常但没有")
 except AssertionError as e:
-    print(f"✅ 正确拒绝 top_p=0: {e}")
+    print(f"✅ 正确拒绝 temperature=0: {e}")
 ```
 
 改成检查新默认值和新字段：
@@ -381,6 +385,119 @@ assert sp2.top_p == 0.9
 - `top_k=-1`
 - `top_p=0`
 - `max_tokens=0`
+
+### 补充改动 1：把 `Context` 导入改成当前真实接口
+
+修改位置：
+
+- 文件：`nano_vll_repro/tests/test_Day1.py`
+- 锚点：定位到顶部 import 区，把原来的 `utils.context` 导入整行替换成下面这行
+
+```python
+from utils.context import Context, get_context, set_context, reset_context
+```
+
+原因：
+
+1. 当前 `set_context()` 需要的是 `Context(...)` 对象
+2. 如果测试文件不导入 `Context`，后面的调用替换根本写不出来
+
+### 补充改动 2：把 `set_context(...)` 的旧关键字调用改成 `Context(...)`
+
+修改位置：
+
+- 文件：`nano_vll_repro/tests/test_Day1.py`
+- 锚点 1：定位到 `test_context()` 里“模拟 Prefill 阶段设置”
+- 锚点 2：定位到同一个函数里“模拟 Decode 阶段设置”
+
+把旧的：
+
+```python
+set_context(
+    is_prefill=True,
+    cu_seqlens_q=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
+    cu_seqlens_k=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
+    max_seqlen_q=5,
+    max_seqlen_k=5,
+    slot_mapping=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+)
+```
+
+改成：
+
+```python
+set_context(
+    Context(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 4, 6, 11], dtype=torch.int32),
+        max_seqlen_q=5,
+        max_seqlen_k=5,
+        slot_mapping=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        context_lens=None,
+        block_tables=None,
+        max_context_len=0,
+        max_num_blocks=0,
+        kv_cache=None,
+    )
+)
+```
+
+把旧的 decode 版本：
+
+```python
+set_context(
+    is_prefill=False,
+    context_lens=torch.tensor([10, 8, 15]),
+    block_tables=torch.tensor([[0, 1], [2, 3], [4, 5]])
+)
+```
+
+改成：
+
+```python
+set_context(
+    Context(
+        is_prefill=False,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=0,
+        max_seqlen_k=0,
+        slot_mapping=None,
+        context_lens=torch.tensor([10, 8, 15]),
+        block_tables=torch.tensor([[0, 1], [2, 3], [4, 5]]),
+        max_context_len=15,
+        max_num_blocks=2,
+        kv_cache=None,
+    )
+)
+```
+
+这里不要嫌“字段写得长”。你这个测试文件的职责是把 `Context` 结构真实锁住，而不是偷省几行。
+
+### 补充改动 3：把 `Config(model=...)` 改成 `Config(model_path=...)`
+
+修改位置：
+
+- 文件：`nano_vll_repro/tests/test_Day1.py`
+- 锚点：定位到 `def test_config()` 里的 `Config(...)` 构造
+
+把旧的：
+
+```python
+config = Config(model="models/Qwen3-0.6B")
+```
+
+改成：
+
+```python
+config = Config(model_path="models/Qwen3-0.6B")
+```
+
+原因很简单：
+
+1. 当前 `Config` 的实际 dataclass 字段名就是 `model_path`
+2. `model` 只是只读 property，不是构造参数
 
 ---
 

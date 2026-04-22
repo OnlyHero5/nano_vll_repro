@@ -1,42 +1,50 @@
-# 06. 实现 CUDA Graph 基础版（只图化 decode，且只做 exact-match replay）
+# 06. 实现 CUDA Graph 基础版（先做单卡 decode-only graph，再谈更复杂档位）
 
 ## 1. 本篇目标
 
-这一篇的任务不是“把整个系统都图化”，而是给你当前这份教学仓库加一版边界清晰、能解释、能验收的 decode-only CUDA Graph。
+这一篇的任务不是“把整个系统都图化”，而是先给你当前这份教学仓库加上一版：
+
+1. 边界清晰
+2. 行为可解释
+3. 测试可验收
+4. 不和前面单卡主循环打架
+
+的 decode-only CUDA Graph。
 
 本篇完成后，目标行为应当是：
 
 1. 只在 CUDA 环境下启用
 2. 只在 `enforce_eager=False` 时启用
-3. 只图化 decode 路径
-4. 只在 batch size 命中已录制图时 replay
-5. 其他情况全部回退 eager
+3. 当前基础版只支持单卡 graph，不和 TP 交叉
+4. 只图化 decode 路径
+5. 只有 batch size 精确命中已录制档位时才 replay
+6. 其他情况全部回退 eager
 
-这一步的核心不是“追求极限快”，而是把：
+这里先把范围写死：
 
-- 静态输入 buffer
-- graph capture
-- graph replay
-- eager fallback
-
-这四件事讲清楚并落到你当前仓库里。
+> 本篇先不做“TP + CUDA Graph 联动”。也就是 `tensor_parallel_size > 1` 时，当前基础版直接退回 eager。这样你一次只面对一类新复杂度，而不是把通信问题和 graph 问题绑在一起调。
 
 ---
 
 ## 2. 权威参考
 
-本篇只对照：
+本篇对照下面 3 组来源：
 
 1. 当前仓库：
-   - `utils/context.py`
-   - `engine/model_runner.py`
-2. 上游参考：
-   - `nano-vllm/nanovllm/engine/model_runner.py`
-   - `nano-vllm/nanovllm/utils/context.py`
+   - `nano_vll_repro/utils/context.py`
+   - `nano_vll_repro/engine/model_runner.py`
+2. 上游主仓库：
+   - `https://github.com/GeeeekExplorer/nano-vllm`
+   - `nanovllm/engine/model_runner.py`
+   - `nanovllm/utils/context.py`
+3. 你前面已经补齐的本地前提：
+   - [02-补齐Qwen3模型主干与权重映射.md](/home/psx/nano_vllm_repro/nano_vll_repro/plans/02-补齐Qwen3模型主干与权重映射.md)
+   - [04-补齐单卡推理链路与Day5测试.md](/home/psx/nano_vllm_repro/nano_vll_repro/plans/04-补齐单卡推理链路与Day5测试.md)
+   - [05-实现Tensor-Parallel基础版.md](/home/psx/nano_vllm_repro/nano_vll_repro/plans/05-实现Tensor-Parallel基础版.md)
 
-还要明确一个前提：
+这里有一个前提一定要说清楚：
 
-> 你当前仓库在 `04` 已经把 `run_model()` 抽出来了；这一篇默认你已经按 `04` 的写法完成接口收口，否则这里的图捕获边界会不清晰。
+> 本篇默认你已经按 `04` 把 `run_model()`、`compute_logits()`、`reset_context()` 这些运行时边界收口好了。没有这些边界，graph capture 会直接变成一团混在一起的大函数。
 
 ---
 
@@ -44,29 +52,35 @@
 
 ### 3.1 `utils/context.py`
 
-当前其实已经有：
+当前 [utils/context.py](/home/psx/nano_vllm_repro/nano_vll_repro/utils/context.py:24) 已经有：
 
-- `Context` dataclass
-- `set_context()`
-- `get_context()`
-- `reset_context()`
+1. `Context` dataclass
+2. `set_context()`
+3. `get_context()`
+4. `reset_context()`
 
-但还没有把“graph replay 时的静态 context”这个需求写清楚。
+所以这一步真正缺的不是“上下文机制不存在”，而是：
+
+1. 图录制和图回放时，哪些字段必须是静态 buffer
+2. 为什么每次 `run()` 末尾仍然必须统一 `reset_context()`
+3. 为什么 `Context` 要继续保持成纯数据容器，而不是把 graph 状态塞进去
 
 ### 3.2 `engine/model_runner.py`
 
-当前 runner 已经具备两个非常好的前置条件：
+当前如果你已经按 04 收口，`ModelRunner` 应该具备：
 
-1. `prepare_decode()` 已经能把 decode 所需元数据收集出来
-2. `run_model()` 已经是单独的边界
+1. `prepare_prefill()`
+2. `prepare_decode()`
+3. `run_model()`
+4. `run()`
 
-但还缺 5 个核心部件：
+但它还缺少 5 个核心部件：
 
-1. decode graph runner 的静态 buffer 容器
-2. graph capture 入口
-3. graph replay 入口
-4. 命中 / fallback 分发逻辑
-5. `allocate_kv_cache()` 完成后触发 capture 的时机
+1. decode graph 资源容器
+2. graph 开关与图表缓存
+3. capture 入口
+4. replay 入口
+5. “命中图则 replay，否则 eager” 的统一分发逻辑
 
 ---
 
@@ -76,55 +90,54 @@
 
 原因非常实际：
 
-- decode 图里 attention 会访问真实 KV Cache
-- 如果先 capture、后分配 cache，图里引用的对象就不稳定
+1. decode 图里 attention 会访问真实 KV Cache
+2. 如果先 capture、后分配 cache，图里引用的对象就不稳定
 
 ### 4.2 sampler 不进 graph
 
 这一步只 capture：
 
-- `model(input_ids, positions)` 主干
-- 对应的静态 decode `Context`
+1. `model(input_ids, positions)` 主干
+2. 对应的 decode `Context`
 
-采样仍然在 graph 外做，原因有两个：
+采样仍然在 graph 外，原因很简单：
 
-1. sampler 本身包含随机数与动态参数，不适合先塞进基础版 graph
-2. 你现在真正要学的是“主干 replay”，不是“把所有东西都图化”
+1. sampler 本身包含随机数和动态采样参数
+2. 当前教学仓库真正要讲清楚的是“主干 replay”，不是“把所有东西都图化”
 
-### 4.3 先做 exact-match，不做 padding 命中更大图
+### 4.3 先做 exact-match，不做 padding 命中更大档位
 
-教学版的策略是：
+基础版策略统一为：
 
-- batch size 精确命中某个已录制图时 replay
-- 否则 eager
+1. batch size 精确命中某个档位时 replay
+2. 否则 eager
 
 现在不要提前引入：
 
-- padding 到更大 batch
-- graph 档位合并策略
-- 图缓存淘汰策略
+1. padding 到更大 batch
+2. 图档位合并
+3. 图缓存淘汰策略
+
+### 4.4 当前基础版先只支持单卡 graph
+
+这里刻意再强调一次：
+
+1. `tensor_parallel_size > 1` 时，当前基础版直接禁用 graph
+2. 这是为了先把 decode-only graph 的数据流讲清楚
+3. TP 与 graph 的交叉优化可以以后单开一篇
 
 ---
 
 ## 5. 逐步修改
 
-## 5.1 先把 `Context` 保持成“纯数据”，并明确 reset 语义
+## 5.1 保持 `Context` 为纯数据容器，并补清楚 reset 语义
 
 修改位置：
 
 - 文件：`nano_vll_repro/utils/context.py`
-- 锚点 1：定位到 `@dataclass class Context`
-- 锚点 2：定位到 `reset_context()`
-- 操作：用下面给出的类注释和函数注释替换原有简写说明；如果字段定义与下面代码不同，以替代代码为准
+- 操作：不改字段结构，只改类注释和 `reset_context()` 注释
 
-`utils/context.py` 本篇不需要大改结构，但要把注释和字段职责写清楚，尤其是下面这 4 个字段：
-
-- `slot_mapping`
-- `context_lens`
-- `block_tables`
-- `kv_cache`
-
-推荐你把 `Context` 的类注释收口成下面这种风格：
+推荐替代注释如下：
 
 ```python
 @dataclass
@@ -132,44 +145,72 @@ class Context:
     """
     全局推理上下文。
 
-    输入：由 ModelRunner 在 prepare_prefill / prepare_decode / graph replay 前设置。
-    输出：由 Attention 层在 forward 内读取。
+    输入：
+    - 由 ModelRunner 在 prepare_prefill / prepare_decode / graph replay 前设置。
+
+    输出：
+    - 由 Attention 层在 forward 中读取。
 
     设计边界：
-    - 这里不做任何计算，只保存当前 step 所需的静态元数据；
-    - 之所以保留全局单例，而不是层层传参，是因为当前仓库是教学版 token 流模型，修改所有中间层签名的成本过高。
+    1. 这里只保存“当前 step 已经整理好的静态元数据”。
+    2. 这里不做任何计算，也不持有 graph 状态对象。
+    3. 保持成纯数据容器，是为了让 eager 路径和 graph 路径共享同一套读取协议。
     """
 ```
 
-然后确保 `reset_context()` 的注释明确写出一句：
+`reset_context()` 的注释建议改成：
 
-> 每次 run 结束后、每次 graph capture 结束后，都必须恢复为一个新的空 `Context()`。
+```python
+def reset_context():
+    """
+    重置全局 Context。
 
-这句话是后面排查 graph 污染问题的关键。
+    这一步必须在两个场景统一调用：
+    1. 每次 `run()` 结束后
+    2. 每次 graph capture 完成后
+
+    原因：
+    - Context 是“当前 step 的元数据快照”
+    - 如果不在 step 边界清空，下一轮 eager / replay 都可能读到上一个 batch 的旧数据
+    """
+
+    global _current_context
+    _current_context = Context()
+```
+
+这里真正重要的不是文案，而是你后面排查 graph 污染问题时，会反复依赖这条纪律。
 
 ---
 
-## 5.2 在 `ModelRunner` 里新增 `DecodeGraphRunner` 容器
+## 5.2 在 `ModelRunner` 顶部新增 `DecodeGraphRunner` 容器
 
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 import 区之后、`class ModelRunner` 定义之前，插入下面这份 `@dataclass DecodeGraphRunner`
+- 操作：在 import 区之后、`class ModelRunner` 之前插入下面这份 dataclass
 
-不要把所有静态 buffer 散落成十几个 `self.xxx` 变量，后面会很难维护。建议直接在 `engine/model_runner.py` 顶部加一个 dataclass：
+完整新增代码如下：
 
 ```python
+from dataclasses import dataclass
+
+
 @dataclass
 class DecodeGraphRunner:
     """
-    单个 decode batch size 对应的一组静态图资源。
+    单个 decode batch size 档位对应的一组静态 graph 资源。
 
-    输入：batch_size 档位、静态输入 buffer、CUDA Graph 实例。
-    输出：graph replay 所需的全部状态容器。
+    这里把所有静态 buffer 收进一个结构体，原因有两个：
+    1. 后面你会同时持有多个 batch size 的图
+    2. 如果把这些资源都散成 `self.xxx`，状态很快就会失控
 
-    为什么要单独做 dataclass：
-    - 你后面会同时持有多个 batch size 的图；
-    - 如果不把资源收进一个结构体，self 上的状态会迅速失控。
+    字段说明：
+    - batch_size: 这个 graph 档位对应的 decode batch 大小
+    - max_num_blocks: 当前静态 block table 的列数上限
+    - input_ids / positions: replay 前每次都会写入最新 decode 输入
+    - slot_mapping / context_lens / block_tables: replay 前每次都会写入最新 decode Context
+    - hidden_states: graph replay 后产出的主干输出
+    - graph: 当前档位对应的 CUDA Graph 实例
     """
 
     batch_size: int
@@ -183,37 +224,44 @@ class DecodeGraphRunner:
     graph: torch.cuda.CUDAGraph
 ```
 
-这里刻意只保留主干输出 `hidden_states`，不把 logits 放进图里。原因是：
+这里刻意只缓存 `hidden_states`，不缓存 logits。原因是：
 
-- vocab 维太大
-- `compute_logits()` 放在 graph 外更灵活
+1. `compute_logits()` 放在 graph 外更灵活
+2. vocab 维通常很大，基础版没必要急着把 lm head 也塞进去
 
 ---
 
-## 5.3 在 `__init__()` 里先声明 graph 开关和图表容器
+## 5.3 在 `ModelRunner.__init__()` 里补 graph 开关和图表容器
 
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 `ModelRunner.__init__()` 里 `self.sampler` 与 `self.kv_cache` 定义附近
-- 操作：把下面这两行 graph 初始化代码插入到相同区域
+- 操作：在 `self.sampler` 与 `self.kv_cache` 附近插入下面这段
 
-在 `ModelRunner.__init__()` 里，`self.sampler` 和 `self.kv_cache` 附近新增：
+完整新增代码如下：
 
 ```python
+# ===== CUDA Graph 相关状态 =====
+# decode_graphs 按 batch size 存图，key 就是 exact-match 档位。
 self.decode_graphs: dict[int, DecodeGraphRunner] = {}
+
+# 当前基础版只在这些条件都满足时才启用 graph：
+# 1. CUDA 可用
+# 2. 当前 device 确实是 CUDA
+# 3. 用户没有强制 eager
+# 4. 当前不是 TP 模式（教学版先不处理 TP + graph 交叉复杂度）
 self.use_cuda_graph = (
     torch.cuda.is_available()
     and self.device.type == "cuda"
     and not self.config.enforce_eager
+    and self.config.tensor_parallel_size == 1
 )
 ```
 
-这里不要立刻 capture，原因前面已经说过：
+这里不要在 `__init__()` 里立刻 capture。原因前面已经说过：
 
-- `__init__()` 时 KV Cache 还没分配
-
-所以真正的 capture 时机放到 `allocate_kv_cache()` 末尾。
+1. `__init__()` 时 KV Cache 还没分配
+2. graph capture 必须建立在最终的 cache 对象之上
 
 ---
 
@@ -222,77 +270,91 @@ self.use_cuda_graph = (
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 `allocate_kv_cache()` 的最后一个 `print(...)` 之后、方法返回前
-- 操作：插入下面这段 capture 触发逻辑
+- 操作：在 `allocate_kv_cache()` 最后一个 `print(...)` 之后插入下面这段
 
-在当前分配逻辑结束后补：
+完整新增代码如下：
 
 ```python
+# KV Cache 分配完成之后，graph 所依赖的静态 cache 引用才真正稳定。
+# 因此 capture 触发时机必须放在这里，而不是更早。
 if self.use_cuda_graph and not self.decode_graphs:
     self.capture_decode_graphs()
 ```
 
-加 `not self.decode_graphs` 的原因很简单：
+这里保留 `not self.decode_graphs` 是为了避免：
 
-- `allocate_kv_cache()` 可能被重复调用
-- 不要每次都重复 capture 一套图
+1. 重复调用 `allocate_kv_cache()`
+2. 每次都把整套 decode 图重新录一遍
 
 ---
 
-## 5.5 新增 `capture_decode_graphs()`：先确定档位，再逐个 capture
+## 5.5 新增 `capture_decode_graphs()`
 
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 `allocate_kv_cache()` 后、`run_model()` 前
-- 操作：插入下面这份完整 `capture_decode_graphs()` 方法
+- 操作：在 `allocate_kv_cache()` 后、`run_model()` 前插入下面这份完整方法
 
-教学版建议直接录制：
-
-```python
-capture_batch_sizes = list(range(1, self.config.max_cudagraph_batch_size + 1))
-```
-
-因为它最好理解。虽然不是最省显存，但对 0.6B 教学仓库足够清楚。
-
-方法骨架建议写成：
+完整新增代码如下：
 
 ```python
 @torch.inference_mode()
 def capture_decode_graphs(self) -> None:
     """
-    输入：无；依赖已分配好的 self.kv_cache 与模型。
-    输出：无；在 self.decode_graphs 里缓存各 batch size 的图。
+    录制当前基础版 decode graphs。
 
-    当前策略：
-    - 只捕获 decode
-    - 只捕获 exact-match 档位
-    - 每个档位拥有独立静态 buffer
+    输入：
+    - 无；依赖已经稳定存在的 `self.model`、`self.kv_cache` 和 `self.device`
+
+    输出：
+    - 无；把不同 batch size 档位的图写入 `self.decode_graphs`
+
+    当前策略固定为：
+    1. 只录 decode
+    2. 只录 exact-match 档位
+    3. batch size 从 1 录到 `max_cudagraph_batch_size`
     """
+
+    # graph 开关没打开时，这个方法应该是空操作。
     if not self.use_cuda_graph:
         return
 
+    # block table 静态 buffer 的列数上限按最大上下文长度推。
     max_num_blocks = max(1, self.config.max_model_len // self.block_size + 1)
     hidden_size = self.model.config.hidden_size
 
     for batch_size in range(1, self.config.max_cudagraph_batch_size + 1):
+        # ===== 为当前档位创建静态输入 buffer =====
+        # 这些张量会在每次 replay 前被最新 decode 数据覆盖。
         input_ids = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
         slot_mapping = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        context_lens = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+        context_lens = torch.ones(batch_size, dtype=torch.int32, device=self.device)
         block_tables = torch.zeros(batch_size, max_num_blocks, dtype=torch.int32, device=self.device)
-        hidden_states = torch.zeros(batch_size, hidden_size, dtype=self.config.torch_dtype, device=self.device)
+
+        # hidden_states 是 graph 的输出 buffer。
+        hidden_states = torch.zeros(
+            batch_size,
+            hidden_size,
+            dtype=self.config.torch_dtype,
+            device=self.device,
+        )
 
         graph = torch.cuda.CUDAGraph()
 
-        # 先做一次 warmup，让相关 kernel 与缓存状态稳定下来。
+        # ===== warmup =====
+        # 先用一轮普通 eager 让相关 kernel 和 cache 状态稳定下来。
         set_context(
             Context(
                 is_prefill=False,
+                cu_seqlens_q=None,
+                cu_seqlens_k=None,
+                max_seqlen_q=0,
+                max_seqlen_k=0,
                 slot_mapping=slot_mapping,
                 context_lens=context_lens,
                 block_tables=block_tables,
-                max_context_len=0,
+                max_context_len=1,
                 max_num_blocks=max_num_blocks,
                 kv_cache=self.kv_cache,
             )
@@ -300,21 +362,31 @@ def capture_decode_graphs(self) -> None:
         hidden_states.copy_(self.model(input_ids, positions))
         torch.cuda.synchronize()
 
+        # ===== 正式 capture =====
+        # capture 块内部也要重新 set_context，
+        # 因为 graph 记录的是对这些静态 tensor 的访问关系。
         with torch.cuda.graph(graph):
             set_context(
                 Context(
                     is_prefill=False,
+                    cu_seqlens_q=None,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=0,
+                    max_seqlen_k=0,
                     slot_mapping=slot_mapping,
                     context_lens=context_lens,
                     block_tables=block_tables,
-                    max_context_len=0,
+                    max_context_len=1,
                     max_num_blocks=max_num_blocks,
                     kv_cache=self.kv_cache,
                 )
             )
             hidden_states.copy_(self.model(input_ids, positions))
 
+        # capture 完一个档位之后，立即清空全局 Context，
+        # 避免下一个档位沿用上一个档位的静态对象引用。
         reset_context()
+
         self.decode_graphs[batch_size] = DecodeGraphRunner(
             batch_size=batch_size,
             max_num_blocks=max_num_blocks,
@@ -328,21 +400,21 @@ def capture_decode_graphs(self) -> None:
         )
 ```
 
-这里最重要的两个细节：
+这里最重要的两个细节是：
 
-1. warmup 不是可有可无，它能减少 capture 时第一次运行带来的不稳定因素
-2. capture 块内也要重新 `set_context(...)`，因为 graph 记录的是对这些静态张量的访问关系
+1. warmup 不是可有可无，它能减少第一次 capture 的不稳定因素。
+2. capture 块内也必须重新 `set_context(...)`，因为 graph 记录的是静态张量访问图，而不是抽象逻辑。
 
 ---
 
-## 5.6 在 `run_model()` 里加“命中图则 replay，否则 eager”的分发逻辑
+## 5.6 让 `run_model()` 变成 graph-aware 分发入口
 
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 `def run_model(...)`；如果这个方法是 Day4 新增的，就直接从方法签名开始整段替换为下面这份 graph-aware 版本
+- 操作：把 `run_model()` 整个方法替换为下面这份完整实现
 
-这一步建议把 `run_model()` 的开头改成：
+完整替代代码如下：
 
 ```python
 @torch.inference_mode()
@@ -353,17 +425,24 @@ def run_model(
     is_prefill: bool = False,
 ) -> torch.Tensor:
     """
-    输入：
-    - input_ids / positions: 当前 step 的输入
-    - is_prefill: 当前是否为 prefill
+    运行模型主干并返回 logits。
 
-    输出：logits
+    输入：
+    1. input_ids
+    2. positions
+    3. is_prefill
+
+    输出：
+    - vocab 维 logits
 
     分发规则：
-    - prefill 永远 eager
-    - decode 若命中已录制 batch size，则 replay
-    - 否则 eager fallback
+    1. prefill 永远 eager
+    2. graph 开关关闭时 eager
+    3. batch size 没命中图档位时 eager
+    4. 其他情况 replay
     """
+
+    # ===== eager 路径 =====
     if (
         is_prefill
         or not self.use_cuda_graph
@@ -372,19 +451,29 @@ def run_model(
         hidden_states = self.model(input_ids, positions)
         return self.model.compute_logits(hidden_states)
 
+    # ===== graph replay 路径 =====
     graph_runner = self.decode_graphs[input_ids.size(0)]
     live_context = get_context()
 
+    # replay 前把这次 decode 的真实输入写进静态 buffer。
     graph_runner.input_ids.copy_(input_ids)
     graph_runner.positions.copy_(positions)
     graph_runner.slot_mapping.copy_(live_context.slot_mapping)
     graph_runner.context_lens.copy_(live_context.context_lens)
+
+    # block_tables 的列数是静态上限，live block table 可能更短。
+    # 因此先清零，再只覆盖真实有效区间。
     graph_runner.block_tables.zero_()
     graph_runner.block_tables[:, : live_context.block_tables.size(1)].copy_(live_context.block_tables)
 
+    # replay 前，把全局 Context 切到“引用静态 buffer 的版本”。
     set_context(
         Context(
             is_prefill=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=0,
+            max_seqlen_k=0,
             slot_mapping=graph_runner.slot_mapping,
             context_lens=graph_runner.context_lens,
             block_tables=graph_runner.block_tables,
@@ -393,72 +482,71 @@ def run_model(
             kv_cache=self.kv_cache,
         )
     )
+
+    # graph replay 后，hidden_states 会写到静态输出 buffer。
     graph_runner.graph.replay()
+
+    # logits 仍然放在 graph 外计算，保持基础版边界简单清楚。
     logits = self.model.compute_logits(graph_runner.hidden_states)
     return logits
 ```
 
-然后在 `run()` 里把调用改成：
+这一步真正要理解的是：
 
-```python
-logits = self.run_model(input_ids, positions, is_prefill=is_prefill)
-```
-
-这里的关键理解是：
-
-- graph replay 使用的是静态 buffer
-- 但每次 replay 前必须把“这次 decode 的真实输入与 context”拷进去
+1. graph replay 用的是静态 buffer
+2. 但每次 replay 前，必须先把“这次 decode 的真实输入与 context”拷进去
 
 ---
 
-## 5.7 让 `run()` 继续负责 sampler，并在最后统一 `reset_context()`
+## 5.7 `run()` 仍然只负责 sampler 和统一 `reset_context()`
 
 修改位置：
 
 - 文件：`nano_vll_repro/engine/model_runner.py`
-- 锚点：定位到 `def run(...)` 的尾部 sampler 调用段
-- 操作：把尾部替换成下面这 3 行，确保 graph 与 eager 都统一清理 Context
+- 操作：只改 `run()` 里 `run_model(...)` 的调用签名，并保持尾部 reset 纪律
 
-这一点故意保持和 `04` 一致，不要把 graph 逻辑扩散到 sampler。
-
-`run()` 的尾部建议仍然保持：
+你在 `run()` 里应当保持下面这种结构：
 
 ```python
+logits = self.run_model(input_ids, positions, is_prefill=is_prefill)
+
+if is_prefill:
+    context = get_context()
+    last_token_indices = context.cu_seqlens_q[1:] - 1
+    logits = logits[last_token_indices.long()]
+
 next_tokens = self.sampler(logits, temperatures, top_ks, top_ps)
+
+# 这条 reset 纪律不能删。
+# 原因是 eager 和 replay 两条路径最终都会走到 run() 外层。
 reset_context()
 return next_tokens.tolist()
 ```
 
-不要因为 graph path 已经在 `run_model()` 里改过 context，就省掉这里的 reset。原因是：
+这里不要把 sampler 或 reset 逻辑塞回 `run_model()`，否则：
 
-- eager path 和 graph path 都会经过 `run()`
-- 统一在外层 reset 更不容易漏
+1. graph 分发逻辑会和采样逻辑重新耦合
+2. eager / replay 的清理边界会再次变乱
 
 ---
 
-## 5.8 新增 `tests/test_Day6_cudagraph.py`，这里必须给完整文件
+## 5.8 新增 `tests/test_Day6_cudagraph.py`
 
 直接新建：
 
 - `nano_vll_repro/tests/test_Day6_cudagraph.py`
 
-完整代码如下。注释会比普通测试脚本更密，因为这份文件本身就是 Day6 行为边界的“可执行说明”。
+完整代码如下。依旧保持“测试文件也是行为说明书”的写法。
 
 ```python
 """Day 6 CUDA Graph 测试脚本 - decode graph 行为验收
 
-本文件只验证逻辑边界，不做真实性能评估。
+这份文件只验证行为边界，不做真实性能评估。
 
-它要锁住的行为有三类：
-
-1. `enforce_eager=True` 时不会录制任何 decode graph。
-2. `enforce_eager=False` 且 CUDA 可用时，会录制 `decode_graphs`。
-3. `run_model()` 在命中图与未命中图时都能返回合法 logits。
-
-注意：
-1. 这份测试依赖 CUDA 与本地模型权重。
-2. 这里测试的是“行为正确性”，不是“速度提升多少”。
-3. 注释密度故意较高，便于后续回看时快速理解 graph 的边界。
+要锁住的行为有三类：
+1. `enforce_eager=True` 时不会录制任何 decode graph
+2. `enforce_eager=False` 且单卡 CUDA 环境可用时，会录制 decode graph
+3. `run_model()` 在命中图与未命中图时都能返回合法 logits
 """
 
 import os
@@ -467,64 +555,53 @@ import sys
 import torch
 
 
-# 让测试脚本可以直接导入项目模块。
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, PROJECT_ROOT)
 
 
-# 下面这些导入覆盖了 Day6 真正关心的模块：
-# 1. Config / ModelRunner：图开关、capture、replay 分发逻辑
-# 2. Context / set_context / reset_context：decode replay 前的静态上下文准备
 from config import Config
 from engine.model_runner import ModelRunner
 from utils.context import Context, reset_context, set_context
 
 
-def _get_model_path() -> str:
+def get_model_path() -> str:
     """返回仓库约定的本地模型路径。"""
     return os.path.join(PROJECT_ROOT, "models", "Qwen3-0.6B")
 
 
-def _build_decode_context(runner: ModelRunner, batch_size: int) -> Context:
-    """构造一份最小可运行的 decode Context。
+def build_decode_context(runner: ModelRunner, batch_size: int) -> Context:
+    """
+    构造一份最小可运行的 decode Context。
 
-    输入：
-    - runner: 当前测试用的 ModelRunner
-    - batch_size: 当前 decode batch 大小
-
-    输出：
-    - 一份足以驱动 decode attention 的最小 Context
-
-    这里故意用最小值：
+    这里故意把内容压到最小：
     - context_lens 全部设为 1
-    - block_tables 只给 1 个 block
+    - block_tables 只给 1 列
     - slot_mapping 从 0 开始递增
 
-    这样做的目的不是模拟真实业务，而是尽量降低测试变量。
+    这样测试的重点就只剩：
+    - replay 路径是否会读取正确的静态 buffer
     """
-
-    max_num_blocks = 1
 
     return Context(
         is_prefill=False,
         cu_seqlens_q=None,
         cu_seqlens_k=None,
-        max_seqlen_q=None,
-        max_seqlen_k=None,
+        max_seqlen_q=0,
+        max_seqlen_k=0,
         slot_mapping=torch.arange(batch_size, dtype=torch.long, device=runner.device),
         context_lens=torch.ones(batch_size, dtype=torch.int32, device=runner.device),
-        block_tables=torch.zeros(batch_size, max_num_blocks, dtype=torch.int32, device=runner.device),
+        block_tables=torch.zeros(batch_size, 1, dtype=torch.int32, device=runner.device),
         max_context_len=1,
-        max_num_blocks=max_num_blocks,
+        max_num_blocks=1,
         kv_cache=runner.kv_cache,
     )
 
 
 @torch.inference_mode()
 def test_cudagraph_disabled_by_enforce_eager() -> None:
-    """验证 eager 强制开关会关闭 CUDA Graph。"""
+    """验证 eager 强制开关会关闭 graph。"""
 
-    model_path = _get_model_path()
+    model_path = get_model_path()
 
     if not torch.cuda.is_available():
         print("skip: CUDA Graph 测试需要 CUDA")
@@ -543,17 +620,18 @@ def test_cudagraph_disabled_by_enforce_eager() -> None:
     runner = ModelRunner(config)
     runner.allocate_kv_cache(2)
 
-    # eager 强制打开时，runner 允许完全不启用 graph。
-    assert runner.use_cuda_graph is False or runner.decode_graphs == {}
+    # eager 强制打开时，decode_graphs 应保持为空。
+    assert runner.use_cuda_graph is False
+    assert runner.decode_graphs == {}
 
     print("✅ enforce_eager 关闭 CUDA Graph 的测试通过")
 
 
 @torch.inference_mode()
 def test_cudagraph_capture_decode_graphs() -> None:
-    """验证 decode graph 会按配置档位生成。"""
+    """验证 decode graph 会按配置录制档位。"""
 
-    model_path = _get_model_path()
+    model_path = get_model_path()
 
     if not torch.cuda.is_available():
         print("skip: CUDA Graph 测试需要 CUDA")
@@ -566,13 +644,14 @@ def test_cudagraph_capture_decode_graphs() -> None:
     config = Config(
         model_path=model_path,
         enforce_eager=False,
+        tensor_parallel_size=1,
         max_cudagraph_batch_size=2,
     )
 
     runner = ModelRunner(config)
     runner.allocate_kv_cache(2)
 
-    # 这里要求至少捕获 batch size 1 和 2 两个档位。
+    # 当前基础版至少要录 batch size 1 和 2 两个档位。
     assert 1 in runner.decode_graphs
     assert 2 in runner.decode_graphs
 
@@ -581,9 +660,9 @@ def test_cudagraph_capture_decode_graphs() -> None:
 
 @torch.inference_mode()
 def test_cudagraph_exact_match_and_fallback() -> None:
-    """验证命中图与未命中图的两条路径都可运行。"""
+    """验证命中图与未命中图两条路径都可运行。"""
 
-    model_path = _get_model_path()
+    model_path = get_model_path()
 
     if not torch.cuda.is_available():
         print("skip: CUDA Graph 测试需要 CUDA")
@@ -596,6 +675,7 @@ def test_cudagraph_exact_match_and_fallback() -> None:
     config = Config(
         model_path=model_path,
         enforce_eager=False,
+        tensor_parallel_size=1,
         max_cudagraph_batch_size=2,
     )
 
@@ -606,7 +686,7 @@ def test_cudagraph_exact_match_and_fallback() -> None:
     input_ids = torch.zeros(1, dtype=torch.long, device=runner.device)
     positions = torch.zeros(1, dtype=torch.long, device=runner.device)
 
-    set_context(_build_decode_context(runner, batch_size=1))
+    set_context(build_decode_context(runner, batch_size=1))
     logits_hit = runner.run_model(input_ids, positions, is_prefill=False)
     reset_context()
 
@@ -617,10 +697,9 @@ def test_cudagraph_exact_match_and_fallback() -> None:
     input_ids = torch.zeros(3, dtype=torch.long, device=runner.device)
     positions = torch.arange(3, dtype=torch.long, device=runner.device)
 
-    # 这里显式断言 batch size 3 不在图表里，避免测试失去意义。
     assert 3 not in runner.decode_graphs
 
-    set_context(_build_decode_context(runner, batch_size=3))
+    set_context(build_decode_context(runner, batch_size=3))
     logits_fallback = runner.run_model(input_ids, positions, is_prefill=False)
     reset_context()
 
@@ -644,8 +723,6 @@ if __name__ == "__main__":
     print("=" * 60)
 ```
 
-这份文件必须保证是“可直接复制为测试文件”的完整源码，不允许再退回到函数名占位。
-
 ---
 
 ## 6. 本篇结束后的最小验收
@@ -665,8 +742,8 @@ python tests/test_Day6_cudagraph.py
 
 另外建议手动再做两次真实验证：
 
-1. `enforce_eager=False`、batch size 命中图
-2. `enforce_eager=False`、batch size 超出 `max_cudagraph_batch_size`，确认会回退 eager
+1. `enforce_eager=False` 且 batch size 命中图
+2. `enforce_eager=False` 且 batch size 超出 `max_cudagraph_batch_size`，确认会回退 eager
 
 ---
 
@@ -683,32 +760,40 @@ python tests/test_Day6_cudagraph.py
 
 后果：
 
-- 随机数与动态采样参数会让问题复杂度陡增
-- 你会在一个基础版教学仓库里一次引入两类新变量
+- 采样随机性和动态参数会把基础版复杂度直接拉高
+- 你会失去对“主干 replay 边界”的清晰认识
 
-### 7.3 replay 前忘记把 live context 拷进静态 buffer
+### 7.3 replay 前忘记把 live context 写进静态 buffer
 
 后果：
 
 - graph 虽然 replay 成功
-- 但 attention 读到的是上一次 batch 的 slot/block 信息
+- 但 attention 读到的是上一次 batch 的 slot / block 信息
 
-### 7.4 `run()` 末尾忘记 `reset_context()`
+### 7.4 TP 模式下也硬开当前基础版 graph
 
 后果：
 
-- eager 与 graph 路径互相污染
-- 问题通常在第二次调用后才出现
+- 你会同时面对通信与 graph 两类问题
+- 诊断成本远高于教学收益
+
+### 7.5 `run()` 末尾忘记 `reset_context()`
+
+后果：
+
+- eager 和 replay 两条路径会互相污染
+- 问题通常在第二个 step 才出现，更难查
 
 ---
 
 ## 8. 本篇真正学到的东西
 
-这一篇最重要的不是“会写 `torch.cuda.CUDAGraph()`”，而是你要真正理解：
+这一篇最重要的不是“会写 `torch.cuda.CUDAGraph()`”，而是下面 4 个边界：
 
-1. graph 记录的是“对静态 tensor 的访问图”，不是“自动帮你处理动态输入”。
-2. decode 比 prefill 更适合先图化，因为输入 shape 稳定。
-3. 基础版 graph 的价值在于把边界讲清楚，而不是一开始就追求最复杂的档位策略。
+1. graph 记录的是“对静态张量的访问图”，不是自动处理动态输入。
+2. decode 比 prefill 更适合先图化，因为输入 shape 更稳定。
+3. sampler 保持在 graph 外，可以显著降低基础版复杂度。
+4. TP 和 graph 都重要，但教学仓库最好一次只引入一类新变量。
 
 完成后进入最后一篇：
 

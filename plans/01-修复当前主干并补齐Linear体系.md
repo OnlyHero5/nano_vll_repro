@@ -1,431 +1,371 @@
-# 01. 修复当前主干并补齐 Linear 体系（按现有文件逐段修改）
+# 01. 修复当前主干并收口 Linear/Loader 接口（按当前仓库逐段修改）
 
 ## 1. 本篇目标
 
-这一篇不是“重写整个线性层文件”，而是先把当前主干从“会导入失败 / 结构不完整”修到“后续 Day2 ~ Day6 都能继续接”的状态。
+这一篇的任务不是“把 `layers/linear.py` 重写成 Tensor Parallel 版本”，而是先把当前主干里已经存在的单卡线性层、权重加载协议和 Day4 验收口径整理到一致。
 
-本篇完成后，至少要满足 4 个条件：
+本篇完成后，至少要满足下面 4 个条件：
 
-1. `layers/linear.py` 可以稳定导入，不再有断尾类定义。
-2. `models/qwen3.py` 当前 import 的 `QKVLinear`、`MergedLinear`、`RowLinear` 都能在本地找到。
-3. `utils/loader.py` 能把 HF 的分离权重写入你仓库里的融合参数。
-4. `tests/test_Day4.py` 至少能覆盖 `QKV / Merged / Row` 这三类线性层的基本加载逻辑。
+1. `layers/linear.py` 暴露的公开类名与 `models/qwen3.py`、`tests/test_Day4.py` 完全一致。
+2. `QKVLinear / MergedLinear / RowLinear` 的参数都遵守同一套 `weight_loader` 调用协议。
+3. `utils/loader.py` 能清楚区分 packed 参数和普通参数，并把权重安全写入目标参数。
+4. `tests/test_Day4.py` 至少能覆盖 `QKV / Merged / Row` 三类线性层的基本加载与前向行为。
+
+这里先把边界写死：
+
+> 本篇不引入 `ColumnParallelLinear`、`RowParallelLinear`、`QKVParallelLinear` 这类 TP 线性层。真正的 Tensor Parallel 改造放到 [05-实现Tensor-Parallel基础版.md](/home/psx/nano_vllm_repro/nano_vll_repro/plans/05-实现Tensor-Parallel基础版.md)。
 
 ---
 
 ## 2. 权威参考
 
-本篇只看 3 个来源：
+本篇只看 4 个来源：
 
-1. 你的当前文件：
+1. 当前仓库：
    - `nano_vll_repro/layers/linear.py`
    - `nano_vll_repro/utils/loader.py`
    - `nano_vll_repro/tests/test_Day4.py`
-2. 上游参考：
+   - `nano_vll_repro/models/qwen3.py`
+2. 上游教学实现：
    - `GeeeekExplorer/nano-vllm/nanovllm/layers/linear.py`
    - `GeeeekExplorer/nano-vllm/nanovllm/utils/loader.py`
-3. 你的本地依赖方：
-   - `nano_vll_repro/models/qwen3.py`
+3. Hugging Face 权重命名习惯：
+   - `q_proj / k_proj / v_proj`
+   - `gate_proj / up_proj`
+4. 你当前仓库的运行边界：
+   - Day1 ~ Day4 以单卡、单进程优先
+   - 是否安装 `flash_attn` 会影响 `tests/test_Day4.py` 能否直接启动
 
-这里必须强调：
+这一篇最重要的判断标准不是“像不像上游 TP 实现”，而是：
 
-> 上游 `linear.py` 假设 `torch.distributed` 已初始化；你的仓库当前并没有这个前提，所以不能直接照抄。
+> 文档中的类名、签名和修改步骤，必须与当前仓库真实存在的代码一致。
 
 ---
 
-## 3. 先看当前仓库到底断在哪里
+## 3. 先看当前仓库到底是什么状态
 
-先打开 `layers/linear.py`，你会看到 3 个核心问题：
+先打开 `layers/linear.py`，你会看到当前文件的真实情况和旧文档描述并不一致：
 
-1. `RowParallelLinear` 只有类头，没有完整实现。
-2. 代码里定义的是 `QKVParallelLinear / MergedColumnParallelLinear / RowParallelLinear`，但 `models/qwen3.py` import 的却是 `QKVLinear / MergedLinear / RowLinear`。
-3. 当前实现大量直接写 `dist.get_rank()` / `dist.get_world_size()`，这会让未初始化分布式的单卡测试直接炸掉。
+1. 文件里已经存在的是 `QKVLinear`、`MergedLinear`、`RowLinear`。
+2. `models/qwen3.py` 当前 import 的也是 `QKVLinear`、`MergedLinear`、`RowLinear`，导入名本身并没有漂移。
+3. 当前 `layers/linear.py` 里没有 `RowParallelLinear`、`QKVParallelLinear`、`MergedColumnParallelLinear` 这些类头。
+4. 当前文件里也没有直接写 `dist.get_rank()` / `dist.get_world_size()`，所以“先补单卡安全 fallback”并不是这份代码眼前的主问题。
 
-再看 `utils/loader.py`，会发现它的主逻辑已经接近上游，但还差 3 个细节：
+换句话说，旧版 `plans/01` 开头那段“先看当前仓库到底断在哪里”的判断，本身就是错的，不能继续沿用。
 
-1. 缺一个统一的 `default_weight_loader` 兜底。
-2. 对 packed weight 的参数不存在分支，错误处理不够清晰。
-3. 普通参数和 packed 参数的边界没有在文档里说明白。
+### 3.1 `layers/linear.py` 当前真正的问题
 
-最后看 `tests/test_Day4.py`，你会发现它已经在帮你暴露接口漂移：
+当前文件真正值得修的点主要有 4 个：
 
-- 它只测了 `QKVLinear` 和 `MergedLinear`
-- 还没有把 `RowLinear` 的 `all_reduce / bias` 路径纳入 smoke test
-- sampler 仍然是旧接口，这一篇先不要升级到 `top_k / top_p`
+1. `QKVLinear` 只给 `self.weight` 绑定了 `weight_loader`，如果启用 bias，`self.bias` 没有绑定同样的加载器。
+2. `QKVLinear._weight_loader()`、`MergedLinear._weight_loader()`、`RowLinear._weight_loader()`、`default_weight_loader()` 都是直接 `copy_`，没有统一做 device / dtype 对齐。
+3. `MergedLinear` 的真实签名是 `MergedLinear(input_size, output_size, num_shards=2, bias=False)`，不是“传一个 list 作为多个输出尺寸”。
+4. `RowLinear` 当前是完整的单卡版本，不应该在这一篇里被误写成“只有类头、等待补完”。
+
+### 3.2 `utils/loader.py` 当前真正的问题
+
+`utils/loader.py` 的主流程已经能工作，但文档描述得太乱，导致读者很容易误判：
+
+1. packed 参数和普通参数其实已经共用一套“在参数对象上找 `weight_loader`”的协议。
+2. 当前代码里还有多余的分支注释，好像 `RowLinear` 需要单独走特殊通道，实际上它和普通参数一样，只是恰好也绑定了自定义 loader。
+3. 文档没有明确告诉读者：“packed 参数额外多一个 `shard_id`，普通参数没有。”
+
+### 3.3 `tests/test_Day4.py` 当前真正的问题
+
+这个测试文件也和旧文档说的不一样：
+
+1. 它目前只测了 `QKVLinear` 和 `MergedLinear` 的权重写入。
+2. 它没有覆盖 `RowLinear` 的 `weight_loader` 和前向输出形状。
+3. 它没有锁定“参数对象必须挂有 `weight_loader`”这一条协议。
+4. 它通过 `from layers.linear import ...` 导入时，会先执行 `layers/__init__.py`；如果环境里没有安装 `flash_attn`，测试甚至还没跑到线性层就会先失败。
 
 ---
 
 ## 4. 本篇修改原则
 
-### 4.1 不整文件推翻，只补 3 类能力
+### 4.1 以当前公开接口为准，不虚构并行类名
 
-本篇只改：
+这一篇只围绕下面 3 个真实存在的类展开：
 
-- `layers/linear.py`
-- `utils/loader.py`
-- `tests/test_Day4.py`
+- `QKVLinear`
+- `MergedLinear`
+- `RowLinear`
 
-### 4.2 允许“单卡默认值”，因为现在仓库必须先能跑
+不要在本篇中引入别名兜底，也不要把“未来可能存在的 TP 类名”写成“当前文件已经有，只是没补完”。
 
-你当前仓库大量 Day1 ~ Day5 测试都不会先调用 `init_process_group()`，因此这里一定要做“安全降级”：
+### 4.2 本篇只修单卡主干，不提前做 TP
 
-- world size 未初始化时返回 `1`
-- rank 未初始化时返回 `0`
+为什么这里必须克制：
 
-### 4.3 先提供 alias，再谈完全改名
+1. 当前模型代码和测试代码都还在单卡语义上。
+2. 如果你现在就把 `RowLinear` 改成“按输入维切分 + all_reduce”的写法，会把 `models/qwen3.py`、`tests/test_Day4.py` 和 Day2/Day4 的认知边界全部打乱。
+3. Day5 才是专门引入 TP 头数语义和并行线性层的阶段。
 
-为了不连带改坏 `models/qwen3.py`，本篇先保留当前底层类名，同时新增上层 alias：
+### 4.3 把 `weight_loader` 当作统一协议，而不是散落在 `loader.py` 里的特殊分支
 
-- `QKVLinear = QKVParallelLinear`
-- `MergedLinear = MergedColumnParallelLinear`
-- `RowLinear = RowParallelLinear`
+这篇真正要教会你的不是“写出某几个 if-else”，而是：
 
-这样后面 Day2/Day5 再继续改模型时，接口边界更稳。
+- packed 参数通过 `weight_loader(param, loaded_weight, shard_id)` 写入；
+- 普通参数通过 `weight_loader(param, loaded_weight)` 写入；
+- `utils/loader.py` 只负责分发，不负责知道每一种线性层内部怎么拼。
 
 ---
 
 ## 5. 逐步修改
 
-## 5.1 先在 `linear.py` 文件顶部补“单卡安全”的 TP 辅助函数
+## 5.1 先修 `layers/linear.py` 里的真实缺口
 
-放置位置：
+修改位置：
 
-- `import` 之后
-- `LinearBase` 之前
+- 文件：`nano_vll_repro/layers/linear.py`
+- 重点类：`QKVLinear`、`MergedLinear`、`RowLinear`
+- 重点函数：`default_weight_loader`
 
-为什么先改这里：
+这一段不要重写类层次结构，只补当前文件确实缺失的行为。
 
-- 你后面所有并行线性层都依赖 rank / world size
-- 如果每个类各自写 fallback，会把逻辑分散到整个文件
+### 第一步：补一个统一的安全复制辅助函数
 
-把现有的 `divide()` 保留，然后在它下面补这三个辅助函数：
+建议在文件底部 `default_weight_loader` 附近，或者在几个 loader 之前，统一抽一个小工具函数，例如：
 
 ```python
-def get_tp_world_size() -> int:
-    """
-    输入：无。
-    输出：当前张量并行 world size。
-
-    这里不能直接写 dist.get_world_size()，因为你当前仓库的 Day1~Day5
-    绝大多数测试都不会先初始化分布式环境；未初始化时必须安全返回 1，
-    才能让单卡路径把“并行层”退化成普通线性层。
-    """
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-
-
-def get_tp_rank() -> int:
-    """
-    输入：无。
-    输出：当前张量并行 rank。
-
-    同样地，单卡 / 未初始化分布式环境下必须返回 0；
-    否则 import 阶段就会因为 get_rank() 抛错，后面的任何测试都无法开始。
-    """
-    return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-
-def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+def copy_weight_to_param(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
     """
     输入：
-    1. param: 目标参数，来自当前模型。
-    2. loaded_weight: 从 safetensors / HF 权重里读出来的张量。
+    1. param: 当前模型中的目标参数。
+    2. loaded_weight: 从 safetensors / HF 权重读出的张量。
 
-    输出：无；就地把 loaded_weight 拷到目标参数里。
+    输出：无；原地把权重写入 param。
 
-    注意这里显式转到 param 的 device 和 dtype。
-    原因不是“好看”，而是为了让 CPU 读入的权重在单卡、BF16、FP16 等路径下都能统一工作。
+    这里统一做 device / dtype 对齐，避免 CPU FP32 权重直接写入 CUDA BF16/FP16 参数时报错。
     """
     param.data.copy_(loaded_weight.to(device=param.device, dtype=param.dtype))
 ```
 
-改完以后，再把 `LinearBase.__init__()` 里的：
+为什么建议抽这个函数：
 
-- `self.tp_rank = dist.get_rank() if ...`
-- `self.tp_size = dist.get_world_size() if ...`
+1. 现在 4 个 loader 都各自 `copy_`，以后很容易只修一处漏三处。
+2. 你的仓库后面会开始明确区分 `config.torch_dtype`、CPU 加载与 GPU 参数，这个对齐逻辑迟早要有。
 
-改成统一调用刚才的辅助函数。
+### 第二步：给 `QKVLinear` 的 bias 也绑定 `weight_loader`
+
+当前 `QKVLinear.__init__()` 里只做了：
+
+```python
+self.weight.weight_loader = self._weight_loader
+```
+
+如果后面 `attention_bias=True`，那么 `qkv_proj.bias` 会没有同样的加载协议。这里要补成：
+
+```python
+self.weight.weight_loader = self._weight_loader
+if self.bias is not None:
+    self.bias.weight_loader = self._weight_loader
+```
+
+为什么这是必须修的真实问题：
+
+1. `QKVLinear._weight_loader()` 对 weight 和 bias 都成立，本身并不依赖二维张量。
+2. `models/qwen3.py` 已经保留了 `qkv_bias` 开关，这个分支不应该在真正打开时才暴露问题。
+
+### 第三步：把 4 个 loader 都改成统一走安全复制
+
+这 4 个地方都要同步改：
+
+1. `QKVLinear._weight_loader()`
+2. `MergedLinear._weight_loader()`
+3. `RowLinear._weight_loader()`
+4. `default_weight_loader()`
+
+以 `QKVLinear._weight_loader()` 为例，当前写法是：
+
+```python
+param.data[shard_offset:shard_offset+shard_size].copy_(loaded_weight)
+```
+
+这里应该改成“先对齐，再写入”：
+
+```python
+target = loaded_weight.to(device=param.device, dtype=param.dtype)
+param.data[shard_offset:shard_offset + shard_size].copy_(target)
+```
+
+`MergedLinear` 和 `RowLinear` 也是同一个原则，不要继续裸 `copy_`。
+
+### 第四步：明确 `RowLinear` 这一篇只保持单卡语义
+
+`RowLinear` 当前的说明已经基本正确：
+
+- 单卡版本；
+- 用于 `o_proj` 和 `down_proj`；
+- 暂时不切分输入。
+
+这里要做的是把文档里的误导删掉，而不是把它改造成 TP 版本。你只需要保留这条边界：
+
+> `RowLinear` 在 01 中就是普通线性层包装；等到 05 再把它升级成真正的 row parallel。
 
 ---
 
-## 5.2 把 `LinearBase` 补成真正的抽象基类，而不是半成品容器
+## 5.2 回到 `utils/loader.py`，把加载协议写清楚
 
-当前文件已经有 `LinearBase`，但还有两个教学上必须补的点：
+修改位置：
 
-1. 需要统一初始化权重，保证 smoke test 的行为稳定。
-2. 需要把 `weight_loader` 绑定到参数对象上，后面 `utils/loader.py` 才能无分支调用。
+- 文件：`nano_vll_repro/utils/loader.py`
 
-你不用重写整个类，只要在现有类里补一个 `reset_parameters()`，并在 `__init__()` 最后调用它。
+这一段不要重写外层流程，重点是把“packed 参数”和“普通参数”的协议解释清楚，并顺手把实现收口到更容易读的结构。
 
-建议加成下面这样：
+建议按下面顺序整理：
+
+1. 保留 `packed_modules_mapping = getattr(model, "packed_modules_mapping", {})`
+2. 命中 packed 参数时：
+   - 把原始权重名替换成融合参数名；
+   - 通过 `model.get_parameter()` 找到目标参数；
+   - 调用 `param.weight_loader(param, loaded_weight, shard_id)`。
+3. 没命中 packed 参数时：
+   - 直接查同名参数；
+   - 调用参数上的 `weight_loader`，若不存在则退回 `default_weight_loader(param, loaded_weight)`。
+
+更清晰的局部结构大致应是：
 
 ```python
-def reset_parameters(self) -> None:
-    """
-    输入：无。
-    输出：无；原地初始化 self.weight / self.bias。
+for file_path in glob(os.path.join(model_path, "*.safetensors")):
+    with safe_open(file_path, framework="pt", device="cpu") as f:
+        for weight_name in f.keys():
+            loaded_weight = f.get_tensor(weight_name)
 
-    这里沿用 PyTorch Linear 常见的 kaiming_uniform_ 初始化，
-    目的不是追求训练最优，而是让当前仓库里的层在“未加载真实权重”的测试场景下
-    也能有稳定、可解释的数值范围。
-    """
-    nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-    if self.bias is not None:
-        bound = 1 / (self.weight.size(1) ** 0.5)
-        nn.init.uniform_(self.bias, -bound, bound)
+            for original_name, (packed_name, shard_id) in packed_modules_mapping.items():
+                if original_name not in weight_name:
+                    continue
+
+                param_name = weight_name.replace(original_name, packed_name)
+                param = model.get_parameter(param_name)
+                param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = model.get_parameter(weight_name)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 ```
 
-这里的重点不是初始化公式本身，而是：
+这里最关键的是读者要看明白：
 
-- 以后任何子类都不必自己各写一份初始化
-- 没加载权重时，模型骨架测试不会因为 `torch.empty()` 的脏值而出现随机错误
+1. packed 参数的额外信息只有一个 `shard_id`；
+2. 普通参数和自定义线性层，最终都还是落到“参数对象自己的 loader”；
+3. `loader.py` 不负责理解 QKV 拼接布局，它只负责把权重送到正确的参数对象。
+
+### 一个容易被忽视但很重要的细节
+
+如果你打算顺手提高稳定性，建议把：
+
+```python
+safetensor_files = glob(os.path.join(model_path, "*.safetensors"))
+```
+
+改成排序后的结果：
+
+```python
+safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
+```
+
+原因不是功能正确性，而是：
+
+- 调试日志顺序更稳定；
+- 多文件模型目录下更方便复现问题。
 
 ---
 
-## 5.3 把 `ColumnParallelLinear` 和 `MergedColumnParallelLinear` 改成“单卡也能走”的写法
+## 5.3 把 `tests/test_Day4.py` 改成真正能卡回归的 smoke test
 
-你当前 `ColumnParallelLinear.__init__()` 里直接从 `dist.get_world_size()` 取 `tp_size`，这要改成统一调用 `get_tp_world_size()`。
+修改位置：
 
-只需要改 3 个点：
+- 文件：`nano_vll_repro/tests/test_Day4.py`
 
-1. `tp_size` 来源改成 `get_tp_world_size()`
-2. `weight_loader()` 里分片逻辑保留，但 copy 前转 device / dtype
-3. `MergedColumnParallelLinear.weight_loader()` 里的 `chunk()` 也用同样的安全 copy
+这一篇先不要升级 sampler 接口，也不要把 Day4 写成全模型测试。这里的重点只有线性层。
 
-可以参考下面这段局部补丁：
+建议补下面 3 类断言：
 
-```python
-class ColumnParallelLinear(LinearBase):
-    """列并行 Linear。
+### 断言 1：线性层参数对象都真的带有 `weight_loader`
 
-    输入：完整输入 hidden states。
-    输出：当前 rank 对应的输出分片。
-
-    教学上要注意：
-    - 单卡时它会自然退化成普通 Linear；
-    - 多卡时它按输出维度切分，所以 forward 本身通常不需要 all_reduce。
-    """
-
-    def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        tp_size = get_tp_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias=bias, tp_dim=0)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        # 这里切的是输出维度，对应 weight 的 dim=0。
-        shard_size = param.data.size(self.tp_dim)
-        start_idx = self.tp_rank * shard_size
-        shard = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param.data.copy_(shard.to(device=param.device, dtype=param.dtype))
-```
-
-`MergedColumnParallelLinear` 的核心不是“重新发明一种并行层”，而是：
-
-- 先把多个逻辑线性层沿输出维度拼起来
-- 再在拼好的大矩阵内部，给每个 shard 找到自己的 offset
-
-所以你要重点保留的是：
-
-- `self.output_sizes`
-- `shard_offset`
-- `shard_size`
-
-而不是盲目修改 forward。
-
----
-
-## 5.4 把 `QKVParallelLinear` 写完整，同时补上 alias
-
-这一步的目标不是让它“看起来像上游”，而是让本地 `Qwen3Attention` 真的能依赖它。
-
-你应该在现有 `QKVParallelLinear` 上检查并修正 4 件事：
-
-1. `total_num_kv_heads` 为空时要回退到 `total_num_heads`
-2. `self.num_heads / self.num_kv_heads` 必须是“当前 rank 持有的本地头数”
-3. `weight_loader(..., loaded_shard_id)` 要支持 `"q" / "k" / "v"`
-4. 文件末尾必须补 alias，解决 `models/qwen3.py` 当前 import 失败的问题
-
-文件末尾直接补：
+这一条能直接锁定 `utils/loader.py` 的调用协议：
 
 ```python
-# 这三个 alias 的意义不是“多此一举”，而是为了兼容你当前模型代码已经写死的导入名。
-# 先让主干稳定，再在后续文档里决定是否统一改名。
-QKVLinear = QKVParallelLinear
-MergedLinear = MergedColumnParallelLinear
-RowLinear = RowParallelLinear
+assert hasattr(qkv.weight, "weight_loader")
+assert hasattr(merged.weight, "weight_loader")
+assert hasattr(row.weight, "weight_loader")
 ```
 
----
-
-## 5.5 把 `RowParallelLinear` 补完整，这是当前主干真正断掉的地方
-
-你当前文件在这里直接断尾，所以这一段必须完整补上。
-
-为什么 `RowParallelLinear` 不能照着 `ColumnParallelLinear` 写？
-
-- `ColumnParallelLinear` 按输出切，输入是完整的
-- `RowParallelLinear` 按输入切，输入本身已经是分片
-- 因此 `RowParallelLinear.forward()` 之后需要把各 rank 的部分和做 `all_reduce`
-
-建议补成下面这种结构：
+如果你把 `QKVLinear` 的 bias loader 一并补了，也应该顺手测：
 
 ```python
-class RowParallelLinear(LinearBase):
-    """行并行 Linear。
-
-    输入：当前 rank 持有的输入分片。
-    输出：聚合后的完整输出。
-
-    设计原因：
-    - 这类层通常用于 attention 的 o_proj 和 MLP 的 down_proj；
-    - 它们的输入本身已经被前面的列并行层切开了，所以这里按输入维度分片最自然。
-    """
-
-    def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        tp_size = get_tp_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias=bias, tp_dim=1)
-
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        # bias 不分片，只有 weight 需要按输入维度切。
-        if param.data.ndim == 1:
-            param.data.copy_(loaded_weight.to(device=param.device, dtype=param.dtype))
-            return
-
-        shard_size = param.data.size(self.tp_dim)
-        start_idx = self.tp_rank * shard_size
-        shard = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-        param.data.copy_(shard.to(device=param.device, dtype=param.dtype))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 多卡时只让 rank0 保留 bias，可以避免每张卡都重复加一次 bias。
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
-            dist.all_reduce(y)
-        return y
+qkv_with_bias = QKVLinear(512, num_heads=8, num_kv_heads=2, head_dim=64, bias=True)
+assert hasattr(qkv_with_bias.bias, "weight_loader")
 ```
 
-这里最容易写错的是 bias：
+### 断言 2：`RowLinear` 至少要覆盖一次加载和前向
 
-- 如果每张卡都带 bias，再 `all_reduce`，bias 会被累加多次
-- 所以只让 `rank0` 带 bias 是最简单、也最接近上游语义的做法
-
----
-
-## 5.6 回到 `utils/loader.py`，把 packed weight 和普通 weight 的边界写清楚
-
-这一步不需要重写逻辑，只要把当前实现收口成“任何参数都走同一入口”。
-
-建议你按下面顺序检查：
-
-1. 继续保留 `packed_modules_mapping = getattr(model, "packed_modules_mapping", {})`
-2. 命中 packed name 时，先把 `weight_name` 替换成融合参数名
-3. 然后统一调用目标参数上的 `weight_loader`
-4. 非 packed 参数则退回 `default_weight_loader`
-
-局部片段建议写成这样：
+当前文件缺的正是这一块。最低限度可以补成：
 
 ```python
-def load_model(model: nn.Module, model_path: str) -> None:
-    """
-    输入：
-    1. model: 目标模型；要求 packed_modules_mapping 与参数上的 weight_loader 已就位。
-    2. model_path: Hugging Face safetensors 所在目录。
+row = RowLinear(512, 256, bias=False)
+row_weight = torch.randn(256, 512)
+row.weight.weight_loader(row.weight, row_weight)
 
-    输出：无；直接把权重写入 model。
+x = torch.randn(4, 512)
+y = row(x)
 
-    这里最重要的不是“遍历文件”，而是把“普通参数”和“融合参数”统一为同一种调用协议：
-    最终都是 param.weight_loader(param, loaded_weight, *extra_args)。
-    """
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-
-    for file_path in glob(os.path.join(model_path, "*.safetensors")):
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for weight_name in f.keys():
-                loaded_weight = f.get_tensor(weight_name)
-
-                for original_name, (packed_name, shard_id) in packed_modules_mapping.items():
-                    if original_name not in weight_name:
-                        continue
-
-                    param_name = weight_name.replace(original_name, packed_name)
-                    param = model.get_parameter(param_name)
-                    param.weight_loader(param, loaded_weight, shard_id)
-                    break
-                else:
-                    param = model.get_parameter(weight_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
+assert torch.allclose(row.weight.data, row_weight)
+assert y.shape == (4, 256)
 ```
 
-为什么这里要保留 `for ... else ...`：
+### 断言 3：示例代码要和真实签名一致
 
-- 因为 packed 命中是一种“短路成功”分支
-- 没命中时才应该退回普通加载
-- 这个结构比额外写一层 `is_packed` 标志更清楚
-
----
-
-## 5.7 把 `tests/test_Day4.py` 改成真正能卡住回归的 smoke test
-
-本篇先不要升级 sampler 到 `top_k / top_p`。这里应该只做线性层 smoke test。
-
-建议补两类断言：
-
-1. `RowLinear` 的 weight 分片或单卡复制行为
-2. alias 名称确实能 import 成功
-
-可以把测试的主体调整成下面这种结构：
+这一篇文档和测试里都要统一写成：
 
 ```python
-@torch.inference_mode()
-def test_linear_layers():
-    """
-    这里先只做三件事：
-    1. 验证 alias 名称存在；
-    2. 验证 QKV / Merged 的 weight_loader 会把各分片写到正确偏移；
-    3. 验证 RowLinear 至少能在单卡下完成一次前向传播。
-    """
-    from layers.linear import QKVLinear, MergedLinear, RowLinear
-
-    qkv = QKVLinear(512, num_heads=8, num_kv_heads=2, head_dim=64)
-    merged = MergedLinear(512, [1024, 1024])
-    row = RowLinear(512, 256, bias=False)
-
-    x = torch.randn(4, row.weight.shape[1])
-    y = row(x)
-
-    assert y.shape == (4, 256)
+merged = MergedLinear(512, 1024, num_shards=2)
 ```
 
-如果你愿意多补一步，再加一个显式断言：
+不要再写成：
 
-- `hasattr(qkv.weight, "weight_loader")`
-- `hasattr(merged.weight, "weight_loader")`
-- `hasattr(row.weight, "weight_loader")`
+```python
+merged = MergedLinear(512, [1024, 1024])
+```
 
-这样 `utils/loader.py` 的调用协议就被真正锁住了。
+因为当前仓库里根本不是这个接口。
 
 ---
 
 ## 6. 本篇结束后的最小验收
 
-先做语法级验收：
+先做语法级检查：
 
 ```bash
 cd nano_vll_repro
-python -m py_compile layers/linear.py utils/loader.py
+python -m py_compile layers/linear.py utils/loader.py tests/test_Day4.py
 ```
 
-再跑本篇最小 smoke test：
+再跑本篇 smoke test：
 
 ```bash
 python tests/test_Day4.py
 ```
 
-如果你只想先确认 import 层面稳定，也可以先手动跑：
+如果这里一启动就因为 `flash_attn` 缺失失败，不是线性层逻辑的问题，而是环境前置条件没满足。按照仓库根目录说明先安装依赖：
+
+```bash
+pip install flash-attn
+```
+
+如果你只想先确认导入名和构造签名，可以用一段最小脚本手动看：
 
 ```bash
 python - <<'PY'
 from layers.linear import QKVLinear, MergedLinear, RowLinear
-print(QKVLinear, MergedLinear, RowLinear)
+
+qkv = QKVLinear(512, num_heads=8, num_kv_heads=2, head_dim=64)
+merged = MergedLinear(512, 1024, num_shards=2)
+row = RowLinear(512, 256, bias=False)
+
+print(type(qkv).__name__, type(merged).__name__, type(row).__name__)
 PY
 ```
 
@@ -433,43 +373,56 @@ PY
 
 ## 7. 常见错误
 
-### 7.1 直接把上游 `dist.get_rank()` 抄过来
+### 7.1 把未来 TP 阶段的类名写进当前主干文档
 
 后果：
 
-- 单卡未初始化分布式时直接崩
-- Day2 / Day4 测试还没开始就失败
+- 读者一打开 `layers/linear.py` 就发现文档和代码完全对不上；
+- 还没开始改代码，就先怀疑自己是不是看错了文件。
 
-### 7.2 忘记给 alias
-
-后果：
-
-- `models/qwen3.py` 会继续 import 失败
-- 你以为是模型问题，其实是线性层暴露名不一致
-
-### 7.3 `RowParallelLinear` 所有 rank 都加 bias
+### 7.2 在 01 里提前引入 `dist.get_rank()` / `dist.get_world_size()`
 
 后果：
 
-- 多卡路径下 bias 被重复累加
-- 输出数值会系统性偏大，不是随机误差
+- 当前主干的单卡语义被打乱；
+- 后续读者会误以为 Day1 ~ Day4 已经建立在分布式前提上。
 
-### 7.4 `default_weight_loader` 不做 dtype / device 对齐
+### 7.3 忘记给 `QKVLinear.bias` 绑定 `weight_loader`
 
 后果：
 
-- CPU 读到的权重在 BF16 / FP16 路径容易报 dtype mismatch
-- 后面一旦引入 `config.torch_dtype`，这个坑会更明显
+- 一旦 `attention_bias=True`，加载流程会只修好 weight、漏掉 bias；
+- 这种错误在默认配置下可能长期不暴露，但一开开关就炸。
+
+### 7.4 直接把 CPU FP32 权重裸 `copy_` 到 CUDA BF16/FP16 参数
+
+后果：
+
+- 轻则 dtype mismatch；
+- 重则某些路径下静默发生不一致，后面更难排查。
+
+### 7.5 文档示例继续使用错误签名
+
+典型错误例子：
+
+```python
+MergedLinear(512, [1024, 1024])
+```
+
+后果：
+
+- 读者照抄就会报错；
+- 你以为是实现问题，实际上只是文档把接口写错了。
 
 ---
 
 ## 8. 本篇真正学到的东西
 
-这一篇真正的重点不是“会写几个线性层类”，而是你要弄懂下面 3 件事：
+这一篇真正要吃透的是下面 3 件事：
 
-1. 为什么列并行和行并行的切分维度不同。
-2. 为什么 `weight_loader` 要绑定在参数对象上，而不是塞进 `utils/loader.py` 的大 if-else。
-3. 为什么当前仓库必须先支持“未初始化分布式时安全退化为单卡”。
+1. 当前仓库已经有单卡线性层骨架，问题在于加载协议和测试覆盖，而不是“并行类没补完”。
+2. `weight_loader` 应该绑定在参数对象上，让 `utils/loader.py` 只做分发，不做布局判断。
+3. 文档必须明确阶段边界：01 收口单卡线性层，05 才引入 Tensor Parallel。
 
 完成后进入下一篇：
 

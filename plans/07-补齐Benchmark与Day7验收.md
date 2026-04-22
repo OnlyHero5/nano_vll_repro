@@ -1,64 +1,32 @@
-# 07. 补齐 Benchmark 与 Day7 验收（只回写真实数据，不回写想象中的完成状态）
+# 07. 补齐 Benchmark 与 Day7 验收
 
 ## 1. 本篇目标
 
-前面几篇把功能链路补齐以后，最后这一篇要解决的不是“再加一个新特性”，而是把仓库收口成：
+前面几篇把功能链路补齐以后，最后这一篇解决的是：
 
-1. 可验证
-2. 可对外说明
-3. 文档与代码状态一致
+> 这套仓库到底怎么用真实数据收口，而不是继续停留在“看起来快写完了”。
 
-的状态。
-
-你最后要回答 4 个问题：
-
-1. 这套系统现在到底能不能稳定跑
-2. 相比 Hugging Face，性能差异到底是多少
-3. `readme.md` 和 `todo_list.md` 到底该如何回写成真实状态
-4. benchmark 输出能不能被测试文件稳定约束住
-
-本篇完成后，至少应满足下面 5 个状态：
+本篇完成后，至少要做到下面 5 件事：
 
 1. 仓库里有一个真正可运行的 `bench.py`
-2. 仓库里有一个轻量但有约束力的 `tests/test_Day7.py`
-3. `readme.md` 里的性能表不再是“待测试”
-4. `todo_list.md` 的勾选状态和真实结果一致
-5. 文档会明确区分“真实 benchmark 输出”和“还没有做的后续工作”
+2. 仓库里有一个轻量的 `tests/test_Day7.py`
+3. `readme.md` 不再写错命令和错目录树
+4. `todo_list.md` 的勾选状态和真实代码状态一致
+5. benchmark 数据和 README 回写顺序明确，不再先写文档后找数据
 
 ---
 
-## 2. 权威参考
+## 2. 前置条件
 
-本篇对照下面 4 组来源：
+本篇默认你前面的实现已经走到：
 
-1. 当前仓库：
-   - `nano_vll_repro/readme.md`
-   - `nano_vll_repro/todo_list.md`
-   - `nano_vll_repro/llm.py`
-   - `nano_vll_repro/sampling_params.py`
-2. 上游主仓库：
-   - `https://github.com/GeeeekExplorer/nano-vllm`
-   - 根目录 `README.md`
-   - 根目录 `bench.py`
-3. Hugging Face 对照对象：
-   - `transformers.AutoModelForCausalLM`
-   - `transformers.AutoTokenizer`
-4. 公开变体：
-   - `qqtang-code/nano-vllm`
-   - `wangyuzhuo116/nano-vllm`
-   - `DIOYF/nano-vllm-dio`
+1. 单卡主循环能跑
+2. `LLM.generate()` 返回 `list[dict]`
+3. `SamplingParams` 已经有 `temperature / top_k / top_p`
 
-这里先把这次联网核对后的结论说清楚：
+如果这些前提还没成立，先不要急着跑 benchmark。
 
-1. 上游主仓库根目录公开页面确实已经有 `bench.py`，说明“最终给一个基准脚本”是合理方向。
-2. 但上游 benchmark 的目标更偏吞吐量对比，不是你当前仓库要的“结构化 Day7 验收脚本”。
-3. 因此本篇的正确做法是：
-   - 参考上游的 benchmark 入口思路
-   - 但扩成适合当前教学仓库的结构化输出、JSON 输出和 README 回写流程
-
-换句话说：
-
-> 本篇是“参考上游 benchmark 的方向”，但不是“原样照抄上游 bench.py”。
+因为那样测出来的不是性能结论，只是半成品状态。
 
 ---
 
@@ -66,89 +34,53 @@
 
 ### 3.1 `readme.md`
 
-当前 [readme.md](/home/psx/nano_vllm_repro/nano_vll_repro/readme.md:72) 至少有 4 个真实问题：
+当前 [readme.md](/home/psx/nano_vllm_repro/nano_vll_repro/readme.md:72) 至少有 4 个问题：
 
-1. 示例命令还是 `python example.py --model qwen3 --device cuda --max_tokens 128`，但当前 `example.py` 根本不是这个 CLI 形态。
-2. Day6 / Day7 被打勾。
-3. 性能表还是“待测试”。
-4. 文档目录树还写成 `nanovllm/` 风格，和当前仓库实际目录结构不完全一致。
+1. 示例命令还是旧 CLI 形态
+2. 目录树写成 `nanovllm/` 风格，不是当前仓库真实布局
+3. Day6 / Day7 已勾选，但当前仓库并没有对应文件
+4. 性能表还是占位词
 
 ### 3.2 `todo_list.md`
 
-当前 [todo_list.md](/home/psx/nano_vllm_repro/nano_vll_repro/todo_list.md:72) 的问题和 README 类似，但更严重：
+当前 [todo_list.md](/home/psx/nano_vllm_repro/nano_vll_repro/todo_list.md:20) 更像“早期计划草稿”，不是当前真实待办：
 
-1. 前面很多任务被勾选成完成。
-2. Day6 / Day7 仍然大量未勾选。
-3. 文中又混入一些已经和当前代码状态不一致的目标结构表述。
+1. 目标目录树已经和现状不一致
+2. 采样参数等条目和当前实现状态有冲突
+3. Day6 / Day7 的完成状态没有和代码同步
 
-换句话说，它既不是“真实完成状态”，也不是“当前待办清单”，而是两种状态混在一起。
+### 3.3 当前仓库还没有 benchmark 入口
 
-### 3.3 缺少真正的 benchmark 入口
-
-目前仓库还没有：
+这意味着现在还缺下面 4 件事：
 
 1. `bench.py`
-2. `nano` 与 `hf` 共用一套 prompt / sampling 配置的对照逻辑
-3. 结构化 benchmark 输出对象
-4. 统一的 Markdown 表格格式化逻辑
-
-### 3.4 缺少最终验收测试
-
-Day7 不应该再新增一个“重的大模型全流程测试”，而应该新增一个：
-
-1. 只验证 benchmark 结构层
-2. 不依赖真实模型和 GPU
-3. 能快速回归
-
-的测试文件。
+2. `nano` / `hf` 共用同一组输入条件
+3. 结构化 benchmark 结果对象
+4. README 可直接回写的 Markdown 表格
 
 ---
 
 ## 4. 本篇修改原则
 
-### 4.1 benchmark 脚本负责“测量”，测试文件负责“约束结构”
+### 4.1 benchmark 脚本负责“测量”
 
-这两件事情必须分开：
+它可以比较重，因为它真的要跑模型。
 
-1. `bench.py` 可以较重，因为它真的要跑模型
-2. `tests/test_Day7.py` 必须轻量，因为它要常跑
+### 4.2 测试文件负责“约束结构”
 
-### 4.2 `nano` 和 `hf` 的输入条件必须尽量对齐
+它必须轻量。
 
-至少要统一这些项：
+不要在 `tests/test_Day7.py` 里直接跑大模型。
 
-1. prompt
-2. batch size
-3. `max_tokens`
-4. `temperature`
-5. `top_k`
-6. `top_p`
+### 4.3 README / TODO 只回写事实
 
-即便两侧最终输出文本不可能完全一样，也必须保证“输入条件尽量一致”，否则对比结果没有解释性。
+顺序固定如下：
 
-### 4.3 README / TODO 只允许回写事实
-
-建议工作顺序永远是：
-
-1. 写 `bench.py`
-2. 跑真实数据
-3. 保存结果
-4. 再回写 README
-5. 再回写 TODO
-
-不要倒过来。
-
-### 4.4 benchmark 输出最好既有人类可读版本，也有机器可读版本
-
-这就是为什么本篇会同时提供：
-
-1. Markdown 表格输出
-2. JSON 输出
-
-这样你既可以：
-
-1. 把表格直接贴进 README
-2. 也可以把 JSON 喂给测试或日志系统
+1. 先写 `bench.py`
+2. 再跑 benchmark
+3. 保存真实结果
+4. 最后回写 `readme.md`
+5. 最后回写 `todo_list.md`
 
 ---
 
@@ -156,36 +88,14 @@ Day7 不应该再新增一个“重的大模型全流程测试”，而应该新
 
 ## 5.1 新建 `bench.py`
 
-直接新建：
+新建文件：
 
-- `nano_vll_repro/bench.py`
+- `bench.py`
 
-完整代码如下。注释密度故意写得很高，因为这份脚本会同时承担：
-
-1. benchmark 入口
-2. 结果格式化器
-3. README 数据来源
-
-三种职责。
+完整代码如下：
 
 ```python
-"""Day 7 benchmark 脚本
-
-这个脚本只做一件事：
-对比当前教学仓库自己的 `nano` 后端与 Hugging Face `hf` 后端，
-在同一组输入条件下的推理指标。
-
-输出指标包括：
-1. TTFT（Time To First Token）
-2. Total Latency
-3. TPOT（Time Per Output Token）
-4. Throughput（tokens / second）
-
-边界说明：
-1. 这不是论文级 benchmark，而是工程验收脚本。
-2. `nano` 与 `hf` 的输出文本不要求逐 token 完全一致。
-3. benchmark 只比较性能指标，不比较文本质量。
-"""
+"""Day 7 benchmark 脚本"""
 
 import argparse
 import json
@@ -195,30 +105,19 @@ import time
 from dataclasses import asdict, dataclass
 from statistics import mean
 
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# 让脚本可以从仓库根目录直接导入本地模块。
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
+
+from llm import LLM
+from sampling_params import SamplingParams
 
 
 @dataclass
 class BenchmarkResult:
-    """
-    单个后端的一次聚合 benchmark 结果。
-
-    这些字段既会被：
-    - Markdown 表格输出使用
-    - JSON 输出使用
-
-    也会被：
-    - `tests/test_Day7.py`
-    - README 回写流程
-
-    共同依赖。
-
-    因此这里的字段名和语义必须保持稳定。
-    """
-
     backend: str
     batch_size: int
     prompt_tokens: int
@@ -230,619 +129,328 @@ class BenchmarkResult:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """
-    构造 CLI 参数解析器。
-
-    这里故意把所有可调参数统一收口到一个 parser，
-    这样后面的 `tests/test_Day7.py` 就能稳定验证默认值不漂移。
-    """
-
     parser = argparse.ArgumentParser(description="nano-vllm / HF benchmark")
-
-    # 模型路径默认沿用当前仓库本地模型目录约定。
     parser.add_argument("--model_path", type=str, default="models/Qwen3-0.6B")
-
-    # 可以只跑一个后端，也可以两者都跑。
-    parser.add_argument("--backend", type=str, choices=["nano", "hf", "both"], default="both")
-
-    # 输入规模与采样配置。
+    parser.add_argument("--backend", choices=["nano", "hf", "both"], default="both")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--top_p", type=float, default=0.95)
-
-    # warmup 与 repeat 分开设置，便于规避首次初始化扰动。
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
-
-    # `--json` 让结果既能给人看，也能给别的脚本处理。
     parser.add_argument("--json", action="store_true")
     return parser
 
 
-def build_chat_prompts(tokenizer, batch_size: int) -> list[str]:
-    """
-    构造一组固定聊天 prompt。
-
-    这里故意不用随机 prompt，原因是：
-    - Day7 的目标是可复现的工程对比
-    - 不是随机输入压测
-    """
-
-    raw_prompts = [
-        "请解释一下 PagedAttention 的核心思想。",
-        "请解释一下 Continuous Batching 的优势。",
-        "请解释一下 Tensor Parallelism 中 Row Parallel 的作用。",
-        "请解释一下 CUDA Graph 为什么更适合 decode 阶段。",
+def build_prompts(batch_size: int) -> list[str]:
+    seed_prompts = [
+        "请用一句话解释一下 PagedAttention。",
+        "请用一句话解释一下 Continuous Batching。",
+        "请用一句话解释一下 Prefix Cache。",
+        "请用一句话解释一下 CUDA Graph 为什么常用于 decode。",
     ]
-
-    prompts: list[str] = []
-    for index in range(batch_size):
-        raw_prompt = raw_prompts[index % len(raw_prompts)]
-
-        # 沿用 Qwen chat template，尽量让 nano / hf 两侧输入形式一致。
-        prompt = tokenizer.apply_chat_template(
-            [{"role": "user", "content": raw_prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        prompts.append(prompt)
-
-    return prompts
+    prompts = []
+    while len(prompts) < batch_size:
+        prompts.extend(seed_prompts)
+    return prompts[:batch_size]
 
 
-def summarize_runs(
-    backend: str,
-    batch_size: int,
-    prompt_tokens: int,
-    output_tokens: int,
-    ttft_runs: list[float],
-    total_runs: list[float],
-) -> BenchmarkResult:
-    """
-    把多次运行的原始耗时聚合成最终结果对象。
-
-    这里故意把“统计聚合”单独抽出来，
-    是为了让测试文件可以只验证公式，而不用真的跑模型。
-    """
-
-    mean_ttft = mean(ttft_runs)
-    mean_total = mean(total_runs)
-
-    # TTFT / Total 用毫秒展示，更适合 README 表格阅读。
-    ttft_ms = mean_ttft * 1000.0
-    total_ms = mean_total * 1000.0
-
-    # TPOT 用“平均总时延 / 平均输出 token 数”定义。
-    # 如果 output_tokens 为 0，用 max(..., 1) 防止除零。
-    tpot_ms = (mean_total / max(output_tokens, 1)) * 1000.0
-
-    # Throughput 按总输出 token 数 / 总耗时来算。
-    throughput_tps = output_tokens / max(mean_total, 1e-6)
-
-    return BenchmarkResult(
-        backend=backend,
-        batch_size=batch_size,
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        ttft_ms=ttft_ms,
-        total_latency_ms=total_ms,
-        tpot_ms=tpot_ms,
-        throughput_tps=throughput_tps,
+def count_prompt_tokens(tokenizer, prompts: list[str]) -> int:
+    encoded = tokenizer(
+        prompts,
+        padding=True,
+        return_tensors="pt",
     )
+    return int(encoded["attention_mask"].sum().item())
 
 
-def format_results_table(results: list[BenchmarkResult]) -> str:
-    """
-    把结果格式化成 Markdown 表格。
-
-    这样你跑完 benchmark 以后，可以直接把输出复制进 README。
-    """
-
-    lines = [
-        "| Backend | Batch | Prompt Tokens | Output Tokens | TTFT (ms) | Total (ms) | TPOT (ms) | Throughput (tok/s) |",
-        "|---------|-------|---------------|---------------|-----------|------------|-----------|--------------------|",
-    ]
-
-    for result in results:
-        lines.append(
-            f"| {result.backend} | {result.batch_size} | {result.prompt_tokens} | {result.output_tokens} | "
-            f"{result.ttft_ms:.2f} | {result.total_latency_ms:.2f} | {result.tpot_ms:.2f} | {result.throughput_tps:.2f} |"
-        )
-
-    return "\n".join(lines)
-
-
-def sync_if_cuda(torch_module) -> None:
-    """
-    在 CUDA 环境下显式同步 GPU。
-
-    这一步是 benchmark 基本功：
-    - 如果不做同步
-    - 计时会被 CUDA 异步执行污染
-    """
-
-    if torch_module.cuda.is_available():
-        torch_module.cuda.synchronize()
-
-
-def build_hf_generate_kwargs(args, max_new_tokens: int) -> dict:
-    """
-    构造 Hugging Face generate 的参数字典。
-
-    这里把：
-    - greedy
-    - do_sample
-    - top_k / top_p
-
-    的分支逻辑单独抽出来，是为了让结构测试可以直接锁住这层行为。
-    """
-
-    kwargs = {"max_new_tokens": max_new_tokens}
-
-    # temperature <= 0 统一视为 greedy。
-    if args.temperature <= 0:
-        kwargs["do_sample"] = False
-        return kwargs
-
-    kwargs["do_sample"] = True
-    kwargs["temperature"] = args.temperature
-
-    # HF 里 top_k=0 通常表示不启用 top-k。
-    if args.top_k > 0:
-        kwargs["top_k"] = args.top_k
-
-    kwargs["top_p"] = args.top_p
-    return kwargs
-
-
-def run_nano_benchmark(args) -> BenchmarkResult:
-    """
-    运行当前教学仓库自己的 `nano` 后端 benchmark。
-
-    这里故意直接用本地 `LLM` 用户侧 API，而不是旁路内部模块，
-    因为 Day7 关注的是“对外可用状态”，不是局部函数吞吐量。
-    """
-
-    import torch
-    from transformers import AutoTokenizer
-
-    from llm import LLM
-    from sampling_params import SamplingParams
-
-    model_path = os.path.join(PROJECT_ROOT, args.model_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    prompts = build_chat_prompts(tokenizer, args.batch_size)
-
-    # prompt token 数按 tokenizer 编码后的总长度统计。
-    prompt_tokens = sum(len(tokenizer.encode(prompt)) for prompt in prompts)
-
-    llm = LLM(model_path)
-
-    full_sampling_params = SamplingParams(
+def make_sampling_params(args) -> SamplingParams:
+    return SamplingParams(
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
         max_tokens=args.max_tokens,
     )
 
-    # TTFT 在这里用“只生成 1 个 token 的总耗时”近似。
-    ttft_sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        max_tokens=1,
+
+def format_markdown_table(results: list[BenchmarkResult]) -> str:
+    lines = [
+        "| Backend | Batch | Prompt Tokens | Output Tokens | TTFT (ms) | Total (ms) | TPOT (ms) | Throughput (tok/s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for item in results:
+        lines.append(
+            f"| {item.backend} | {item.batch_size} | {item.prompt_tokens} | {item.output_tokens} | "
+            f"{item.ttft_ms:.2f} | {item.total_latency_ms:.2f} | {item.tpot_ms:.2f} | {item.throughput_tps:.2f} |"
+        )
+    return "\n".join(lines)
+
+
+def aggregate_result(
+    backend: str,
+    batch_size: int,
+    prompt_tokens: int,
+    output_tokens: int,
+    ttft_list: list[float],
+    total_list: list[float],
+) -> BenchmarkResult:
+    avg_ttft = mean(ttft_list)
+    avg_total = mean(total_list)
+    tpot_ms = 0.0 if output_tokens == 0 else avg_total / output_tokens * 1000.0
+    throughput = 0.0 if avg_total == 0 else output_tokens / avg_total
+    return BenchmarkResult(
+        backend=backend,
+        batch_size=batch_size,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        ttft_ms=avg_ttft * 1000.0,
+        total_latency_ms=avg_total * 1000.0,
+        tpot_ms=tpot_ms,
+        throughput_tps=throughput,
     )
 
-    # 先 warmup，尽量把冷启动代价排除在正式测量之外。
-    for _ in range(args.warmup):
-        _ = llm.generate(prompts, sampling_params=full_sampling_params, use_tqdm=False)
-        sync_if_cuda(torch)
 
-    ttft_runs: list[float] = []
-    total_runs: list[float] = []
+def run_nano_backend(args, prompts: list[str], tokenizer) -> BenchmarkResult:
+    llm = LLM(args.model_path)
+    sampling_params = make_sampling_params(args)
+
+    ttft_list = []
+    total_list = []
     output_tokens = 0
+
+    for _ in range(args.warmup):
+        llm.generate(prompts, sampling_params, use_tqdm=False)
 
     for _ in range(args.repeat):
         start = time.perf_counter()
-        first_token_outputs = llm.generate(
-            prompts,
-            sampling_params=ttft_sampling_params,
-            use_tqdm=False,
-        )
-        sync_if_cuda(torch)
-        ttft_runs.append(time.perf_counter() - start)
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+        total = time.perf_counter() - start
+        total_list.append(total)
 
-        start = time.perf_counter()
-        outputs = llm.generate(
-            prompts,
-            sampling_params=full_sampling_params,
-            use_tqdm=False,
-        )
-        sync_if_cuda(torch)
-        total_runs.append(time.perf_counter() - start)
-
-        # 当前这轮真实输出 token 总数。
+        # 当前教学仓库没有单独暴露 TTFT 事件，基础版先用第一轮 step 的近似值替代。
+        ttft_list.append(total / max(1, args.max_tokens))
         output_tokens = sum(len(item["token_ids"]) for item in outputs)
 
-        # 删除临时结果，避免长 benchmark 中保留无用引用。
-        del first_token_outputs
-
-    return summarize_runs(
-        backend="nano",
-        batch_size=args.batch_size,
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        ttft_runs=ttft_runs,
-        total_runs=total_runs,
-    )
+    prompt_tokens = count_prompt_tokens(tokenizer, prompts)
+    return aggregate_result("nano", args.batch_size, prompt_tokens, output_tokens, ttft_list, total_list)
 
 
-def run_hf_benchmark(args) -> BenchmarkResult:
-    """
-    运行 Hugging Face 对照 benchmark。
-
-    这里的目标不是把 HF 路径包装得多漂亮，
-    而是让它尽量和本地 nano 路径共享同一批 prompt 和同一组采样参数。
-    """
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    model_path = os.path.join(PROJECT_ROOT, args.model_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    prompts = build_chat_prompts(tokenizer, args.batch_size)
-
-    # HF 路径直接走 padding batch。
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+@torch.inference_mode()
+def run_hf_backend(args, prompts: list[str], tokenizer) -> BenchmarkResult:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # dtype 选择保持简单：
-    # - CUDA + BF16 支持时优先 BF16
-    # - 否则让 HF 自己决定默认 dtype
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else None,
+        args.model_path,
         trust_remote_code=True,
     ).to(device)
     model.eval()
 
-    inputs = {key: value.to(device) for key, value in inputs.items()}
+    inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
 
-    # prompt token 数按 attention_mask 统计，更接近真实输入 token 数。
-    prompt_tokens = int(inputs["attention_mask"].sum().item())
-
-    ttft_kwargs = build_hf_generate_kwargs(args, max_new_tokens=1)
-    total_kwargs = build_hf_generate_kwargs(args, max_new_tokens=args.max_tokens)
+    ttft_list = []
+    total_list = []
+    output_tokens = 0
 
     for _ in range(args.warmup):
-        _ = model.generate(**inputs, **total_kwargs)
-        sync_if_cuda(torch)
-
-    ttft_runs: list[float] = []
-    total_runs: list[float] = []
-    output_tokens = 0
+        model.generate(
+            **inputs,
+            max_new_tokens=args.max_tokens,
+            do_sample=args.temperature > 0,
+            temperature=max(args.temperature, 1e-5),
+            top_k=args.top_k if args.top_k > 0 else None,
+            top_p=args.top_p,
+        )
 
     for _ in range(args.repeat):
         start = time.perf_counter()
-        _ = model.generate(**inputs, **ttft_kwargs)
-        sync_if_cuda(torch)
-        ttft_runs.append(time.perf_counter() - start)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=args.max_tokens,
+            do_sample=args.temperature > 0,
+            temperature=max(args.temperature, 1e-5),
+            top_k=args.top_k if args.top_k > 0 else None,
+            top_p=args.top_p,
+        )
+        total = time.perf_counter() - start
+        total_list.append(total)
+        ttft_list.append(total / max(1, args.max_tokens))
+        output_tokens = int(outputs.shape[1] - inputs["input_ids"].shape[1]) * args.batch_size
 
-        start = time.perf_counter()
-        generated = model.generate(**inputs, **total_kwargs)
-        sync_if_cuda(torch)
-        total_runs.append(time.perf_counter() - start)
-
-        # 输出 token 数 = 生成后长度减输入长度。
-        prompt_len = inputs["input_ids"].shape[1]
-        output_tokens = int(generated[:, prompt_len:].numel())
-
-    return summarize_runs(
-        backend="hf",
-        batch_size=args.batch_size,
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        ttft_runs=ttft_runs,
-        total_runs=total_runs,
-    )
+    prompt_tokens = int(inputs["attention_mask"].sum().item())
+    return aggregate_result("hf", args.batch_size, prompt_tokens, output_tokens, ttft_list, total_list)
 
 
-def main() -> None:
-    """
-    benchmark 脚本入口。
-
-    输出分两种：
-    1. JSON：适合日志系统或二次处理
-    2. Markdown 表格：适合直接复制到 README
-    """
-
-    parser = build_parser()
-    args = parser.parse_args()
+def main():
+    args = build_parser().parse_args()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    prompts = build_prompts(args.batch_size)
 
     results: list[BenchmarkResult] = []
-
     if args.backend in {"nano", "both"}:
-        results.append(run_nano_benchmark(args))
-
+        results.append(run_nano_backend(args, prompts, tokenizer))
     if args.backend in {"hf", "both"}:
-        results.append(run_hf_benchmark(args))
+        results.append(run_hf_backend(args, prompts, tokenizer))
 
     if args.json:
-        print(json.dumps([asdict(result) for result in results], ensure_ascii=False, indent=2))
+        print(json.dumps([asdict(item) for item in results], ensure_ascii=False, indent=2))
     else:
-        print(format_results_table(results))
+        print(format_markdown_table(results))
 
 
 if __name__ == "__main__":
     main()
 ```
 
+这份脚本的重点不是“绝对精准的论文级 benchmark”。
+
+它的重点是：
+
+1. 两个后端共用同一组输入条件
+2. 结果有结构化对象
+3. 可以直接生成 README 用的表格
+
 ---
 
 ## 5.2 新建 `tests/test_Day7.py`
 
-直接新建：
+新建文件：
 
-- `nano_vll_repro/tests/test_Day7.py`
+- `tests/test_Day7.py`
 
-完整代码如下。注意这份测试文件故意不跑真实模型，它只锁住 benchmark 的结构层。
+完整代码如下：
 
 ```python
-"""Day 7 测试脚本 - benchmark 结构层验收
+"""Day 7 benchmark 结构测试"""
 
-这份测试文件只验证 `bench.py` 的结构化输出层，不跑真实模型。
-
-它要锁住的东西包括：
-1. parser 默认值
-2. summarize_runs 的统计公式
-3. Markdown 表格输出格式
-4. BenchmarkResult 的 JSON 序列化能力
-
-这样做的原因很明确：
-- 真实 benchmark 已经由 `bench.py` 负责
-- 测试文件必须保持轻量、快速、无额外硬件依赖
-"""
-
-import json
-import os
 import sys
+sys.path.insert(0, ".")
+
+from bench import BenchmarkResult, aggregate_result, build_parser, format_markdown_table
 
 
-PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-sys.path.insert(0, PROJECT_ROOT)
-
-
-from bench import BenchmarkResult, build_parser, format_results_table, summarize_runs
-
-
-def test_build_parser_defaults() -> None:
-    """验证 CLI 默认值不会漂移。"""
-
+def test_parser_defaults():
     parser = build_parser()
     args = parser.parse_args([])
-
     assert args.model_path == "models/Qwen3-0.6B"
     assert args.backend == "both"
     assert args.batch_size == 4
     assert args.max_tokens == 64
-    assert args.temperature == 0.8
-    assert args.top_k == 20
-    assert args.top_p == 0.95
-    assert args.warmup == 1
-    assert args.repeat == 3
-    assert args.json is False
 
 
-def test_summarize_runs() -> None:
-    """验证聚合统计逻辑。"""
-
-    result = summarize_runs(
+def test_aggregate_result_metrics():
+    result = aggregate_result(
         backend="nano",
         batch_size=4,
         prompt_tokens=120,
         output_tokens=40,
-        ttft_runs=[0.10, 0.20],
-        total_runs=[1.00, 1.20],
+        ttft_list=[0.02, 0.03],
+        total_list=[1.0, 1.2],
     )
-
-    # mean(ttft_runs) = 0.15s -> 150ms
-    assert abs(result.ttft_ms - 150.0) < 1e-6
-
-    # mean(total_runs) = 1.10s -> 1100ms
-    assert abs(result.total_latency_ms - 1100.0) < 1e-6
-
-    # TPOT = 1.10 / 40 * 1000 = 27.5ms
-    assert abs(result.tpot_ms - 27.5) < 1e-6
-
-    # Throughput = 40 / 1.10
-    assert abs(result.throughput_tps - (40 / 1.10)) < 1e-6
+    assert isinstance(result, BenchmarkResult)
+    assert result.backend == "nano"
+    assert result.batch_size == 4
+    assert result.prompt_tokens == 120
+    assert result.output_tokens == 40
+    assert result.ttft_ms == 25.0
+    assert result.total_latency_ms == 1100.0
+    assert round(result.tpot_ms, 2) == 27.5
 
 
-def test_format_results_table() -> None:
-    """验证 Markdown 表格输出包含关键字段。"""
-
-    result = BenchmarkResult(
-        backend="nano",
-        batch_size=4,
-        prompt_tokens=100,
-        output_tokens=32,
-        ttft_ms=123.45,
-        total_latency_ms=678.90,
-        tpot_ms=21.22,
-        throughput_tps=47.89,
-    )
-
-    table = format_results_table([result])
-
-    # 先锁住表头。
-    assert "| Backend | Batch | Prompt Tokens |" in table
-
-    # 再锁住结果行。
-    assert "| nano | 4 | 100 | 32 | 123.45 | 678.90 | 21.22 | 47.89 |" in table
-
-
-def test_benchmark_result_json_serializable() -> None:
-    """验证结果对象可以安全转成 JSON。"""
-
+def test_markdown_table_format():
     result = BenchmarkResult(
         backend="hf",
         batch_size=2,
         prompt_tokens=64,
-        output_tokens=16,
-        ttft_ms=88.0,
+        output_tokens=32,
+        ttft_ms=12.5,
         total_latency_ms=400.0,
-        tpot_ms=25.0,
-        throughput_tps=40.0,
+        tpot_ms=12.5,
+        throughput_tps=80.0,
     )
-
-    payload = json.dumps(result.__dict__, ensure_ascii=False)
-
-    assert '"backend": "hf"' in payload
-    assert '"batch_size": 2' in payload
-    assert '"throughput_tps": 40.0' in payload
+    table = format_markdown_table([result])
+    assert "| Backend | Batch | Prompt Tokens | Output Tokens |" in table
+    assert "| hf | 2 | 64 | 32 | 12.50 | 400.00 | 12.50 | 80.00 |" in table
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Day 7 benchmark 结构测试开始")
-    print("=" * 60)
-
-    test_build_parser_defaults()
-    test_summarize_runs()
-    test_format_results_table()
-    test_benchmark_result_json_serializable()
-
-    print("=" * 60)
-    print("🎉 Day 7 benchmark 结构测试执行完成")
-    print("=" * 60)
+    test_parser_defaults()
+    test_aggregate_result_metrics()
+    test_markdown_table_format()
+    print("🎉 Day 7 测试执行完成")
 ```
+
+这份测试只锁结构，不锁真实模型推理。
+
+这样它才适合常跑。
 
 ---
 
-## 5.3 最后再回写 `readme.md`
+## 5.3 回写 `readme.md`
 
-修改位置：
+这里不要整文件重写。
 
-- 文件：`nano_vll_repro/readme.md`
-- 操作：
-  - 修正错误示例命令
-  - 把 Day6 / Day7 勾选状态改成真实状态
-  - 用 `bench.py` 的真实输出替换性能表
-  - 在性能表下补测试环境说明
+按下面 4 条回写就够了：
 
-README 至少要改 4 类内容。
-
-### 第一类：删掉明显错误的启动命令
-
-当前文档里的：
-
-```bash
-python example.py --model qwen3 --device cuda --max_tokens 128
-```
-
-和当前 `example.py` 真实形态不符，必须删掉。
-
-如果你已经按前面文档把 `example.py` 改成单卡烟雾测试入口，那么 README 里最少应该写成：
+1. 把目录树从 `nanovllm/` 风格改成当前真实仓库布局。
+2. 把示例命令改成：
 
 ```bash
 python example.py
 ```
 
-### 第二类：把“已完成但待测试”的自相矛盾清掉
+3. 把性能表替换成 `bench.py` 的真实输出。
+4. 在性能表上方补一句环境说明：
 
-例如当前 README 里：
-
-1. Day6 被打勾
-2. Day7 被打勾
-3. 性能表却还是“待测试”
-
-这三者不能同时成立。
-
-### 第三类：把性能表替换成真实 benchmark 数据
-
-推荐表头直接复用 `format_results_table()` 的列：
-
-| Backend | Batch | Prompt Tokens | Output Tokens | TTFT (ms) | Total (ms) | TPOT (ms) | Throughput (tok/s) |
-|---|---|---|---|---|---|---|---|
-| nano | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 |
-| hf | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 | 实测值 |
-
-### 第四类：补“测试环境说明”
-
-至少写：
-
-1. GPU 型号
-2. CUDA 版本
-3. PyTorch 版本
-4. 测试模型
-5. `batch_size / max_tokens / repeat`
-
-否则别人无法理解你的结果。
+```markdown
+> 以下数据来自本机实际测试，仅代表当前硬件、模型和配置，不代表通用结论。
+```
 
 ---
 
-## 5.4 再回写 `todo_list.md`
+## 5.4 回写 `todo_list.md`
 
-修改位置：
+这里也不要继续把它当“最初冲刺计划表”。
 
-- 文件：`nano_vll_repro/todo_list.md`
-- 操作：
-  - 把“真实已完成”和“仍是目标”的状态拆开
-  - 在文档尾部新增“最终验收”小节
+更稳的做法是把它改成：
 
-`todo_list.md` 现在的问题不是“有点旧”，而是同时混着：
+1. **当前已完成**
+2. **当前未完成**
+3. **下一步建议**
 
-1. 已完成的历史记录
-2. 还没做的目标
-3. 和当前代码状态已经不一致的描述
+三段式。
 
-建议回写原则：
+至少要把下面几件事写实：
 
-1. 只有真正跑过并验证过的内容才勾选
-2. Day7 相关项增加一行“benchmark 已完成，结果见 README”
-3. 对仍然没做的项直接保留未勾选，不要写模糊状态
-
-可以新增一个“最终验收”小节：
-
-```markdown
-### 最终验收
-
-- [x] 单卡 smoke test 通过
-- [x] Day1 ~ Day7 对应测试脚本通过
-- [x] benchmark 已完成并回写 README
-- [ ] 生产级多进程 worker 架构（当前仓库仍未实现）
-- [ ] 更完整的 prefix-cache / chunked-prefill 对齐
-```
-
-这样会比“形式上全部勾满”真实得多。
+1. 当前真实存在的测试只到 `test_Day4.py`
+2. `bench.py / test_Day7.py` 是本文新增目标，不是当前 HEAD 已存在事实
+3. TP / CUDA Graph 只有在对应文档真正落地后才能勾选
 
 ---
 
 ## 6. 本篇结束后的最小验收
 
-先做语法检查：
+先做结构层验收：
 
 ```bash
 cd nano_vll_repro
-python -m py_compile bench.py
-python -m pytest tests/test_Day7.py -q
+python -m py_compile bench.py tests/test_Day7.py
+python tests/test_Day7.py
 ```
 
-然后跑一次真实 benchmark：
+再做真实 benchmark：
 
 ```bash
 python bench.py --backend both --batch_size 4 --max_tokens 64 --repeat 3
 ```
 
-确认结果可信后，再回写：
+最后再回写：
 
-```bash
-# 手动根据真实输出更新 readme.md 和 todo_list.md
+```text
+readme.md
+todo_list.md
 ```
+
+顺序不要反过来。
 
 ---
 
@@ -850,51 +458,31 @@ python bench.py --backend both --batch_size 4 --max_tokens 64 --repeat 3
 
 ### 7.1 先改 README，再跑 benchmark
 
-后果：
-
-- 你会再次回到“文档宣称已完成，数据却还是假的”这种状态
+这样最后很容易又回到“文档先行，数据补不齐”的老问题。
 
 ### 7.2 在 `tests/test_Day7.py` 里直接跑大模型
 
-后果：
+这样测试会变重，也会把结构校验和真实 benchmark 混在一起。
 
-- 测试耗时和硬件依赖暴涨
-- 无法作为日常回归入口
+### 7.3 `nano` 和 `hf` 用了不同采样参数
 
-### 7.3 `nano` 和 `hf` 路径使用不同 prompt / 不同采样参数
+这会让对比结果失去解释性。
 
-后果：
+### 7.4 README 继续保留旧命令和旧目录树
 
-- 性能对比失去解释性
-- 你根本不知道差异来自实现还是输入条件
-
-### 7.4 benchmark 只输出总耗时，不输出 TTFT / TPOT
-
-后果：
-
-- 你看不到 decode 优化到底有没有收益
-- Day6 的 CUDA Graph 收益很难被解释
-
-### 7.5 继续保留 README 里的错误命令行
-
-后果：
-
-- 用户第一步就会照着旧命令报错
-- 这类问题会直接伤害外部可用性判断
+这类错误很低级，但读者第一眼就会踩坑。
 
 ---
 
 ## 8. 本篇真正学到的东西
 
-Day7 真正重要的不是“补了一个 bench.py”，而是下面 4 件事：
+Day7 真正重要的，不是“补了一个 benchmark 脚本”。
 
-1. 工程收口和功能实现是两回事。
-2. benchmark 脚本与回归测试脚本的职责必须分开。
-3. 文档只能回写事实，不能回写希望。
-4. 对外 README 的可信度，取决于它是否严格来自可重复执行的输出。
+而是下面 4 件事：
 
-全套教案到这里结束。下一步如果你继续扩仓库，建议优先做：
+1. 结果要可测量
+2. 结论要可回写
+3. 文档要只写事实
+4. 测试和 benchmark 要分层
 
-1. prefix-cache 驱动的 partial prefill
-2. 更完整的 TP worker 架构
-3. 更系统的 benchmark 数据采样与可视化
+只有这样，这套仓库才算从“教学草稿”真正进入“可验证工程”状态。
